@@ -660,3 +660,68 @@ saveRDS(SLEEP, "preprocessed/UKBB_SLEEP.Rds")
 age_at_menopause <- get_field(fld_id = 3581) %>% select(individual_id, instance_id, age_at_menopause = value)
 saveRDS(age_at_menopause, "preprocessed/age_at_menopause.Rds")
 ```
+
+# Olink Proteomics Imputation
+
+`PPP_PLATE_ADJUSTED_IMPUTE1_3K.Rds` was made outside this notebook (SPEC.md section 2.3). After plate adjustment, its missing NPX values were imputed by a Python script with the MICE implementation of fancyimpute 0.3.3, `MICE(n_burn_in = 40, n_imputations = 10)`. `imputeMICE()` is an R port of that script, with the same algorithm and defaults; on simulated data it agrees with the original up to the random draws. With all ~2,900 proteins, each round refits ~2,900 regressions on ~48,000 rows: that takes about 9 days per round with R's default reference BLAS, so link R to an optimized BLAS (on macOS, Apple's vecLib) before running it on the full panel.
+
+```{r impute_mice}
+# fancyimpute MICE with the defaults the script used:
+#   - columns are visited from most to least missing; complete columns are only used as predictors
+#   - missing values start as the column mean of the observed values
+#   - in each round, every incomplete column is regressed on all other columns (their current values)
+#     by Bayesian ridge regression: an intercept, a ridge penalty of lambda_reg * ||X'X|| (Frobenius
+#     norm) on every other coefficient, and residual variance SSR / (n - d)
+#   - its missing values are then redrawn from the posterior predictive distribution,
+#     normal with mean x'beta and variance x'Cov(beta)x + sigma^2
+#   - after n_burn_in rounds, the values of the next n_imputations rounds are averaged, giving one
+#     completed dataset (not multiple imputations)
+# Columns not in impute_columns are carried over unchanged. Call set.seed() first for reproducible draws.
+# Example: imputed <- imputeMICE(df, impute_columns = setdiff(colnames(df), "individual_id"))
+imputeMICE <- function(df, impute_columns, n_burn_in = 40, n_imputations = 10,
+                       lambda_reg = 0.001, verbose = TRUE) {
+  X <- as.matrix(df[impute_columns])
+  storage.mode(X) <- "double"
+  missing <- is.na(X)
+  print(colSums(missing))
+  if (!any(missing)) stop("Input matrix is not missing any values")
+  if (all(missing)) stop("Input matrix must have some non-missing values")
+
+  # visit order: most missing first
+  n_missing <- colSums(missing)
+  visit <- order(n_missing, decreasing = TRUE)
+  visit <- visit[n_missing[visit] > 0]
+  for (j in visit) X[missing[, j], j] <- mean(X[!missing[, j], j])
+
+  start <- Sys.time()
+  total_rounds <- n_burn_in + n_imputations
+  imputed_sum <- numeric(sum(missing))
+  for (round in seq_len(total_rounds)) {
+    if (verbose) message(sprintf("[MICE] Starting imputation round %d/%d, elapsed time %0.3f", round, total_rounds,
+                                 as.numeric(difftime(Sys.time(), start, units = "secs"))))
+    for (j in visit) {
+      miss <- missing[, j]
+      # Bayesian ridge regression on the rows where column j is observed, intercept as the last predictor
+      A <- cbind(X[!miss, -j, drop = FALSE], 1)
+      y <- X[!miss, j]
+      AtA <- crossprod(A)
+      d <- ncol(A)
+      ridge <- lambda_reg * norm(AtA, "F")
+      diag(AtA)[-d] <- diag(AtA)[-d] + ridge # the intercept is not penalized
+      AtA_inv <- solve(AtA)
+      beta <- AtA_inv %*% crossprod(A, y)
+      sigma2 <- sum((y - A %*% beta)^2) / max(nrow(A) - d, 1)
+      # posterior predictive draw for the rows where column j is missing
+      B <- cbind(X[miss, -j, drop = FALSE], 1)
+      mu <- drop(B %*% beta)
+      s2 <- rowSums((B %*% (sigma2 * AtA_inv)) * B) + sigma2
+      s2[s2 <= 1e-5] <- 1e-5
+      X[miss, j] <- rnorm(length(mu), mu, sqrt(s2))
+    }
+    if (round > n_burn_in) imputed_sum <- imputed_sum + X[missing]
+  }
+  X[missing] <- imputed_sum / n_imputations
+  df[impute_columns] <- as.data.frame(X)
+  df
+}
+```

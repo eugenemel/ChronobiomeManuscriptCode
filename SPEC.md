@@ -104,10 +104,11 @@ These fields are extracted but not used in any model:
 | **Total** | | | **3,226** | |
 
 - **NMR metabolomics:** albumin, apolipoprotein B, creatinine, glucose and HDL cholesterol are dropped from the NMR panel in section 1.1 because they have the same column names as the blood biochemistry measurements.
-- **Olink:** NPX values are not individual Showcase fields. UKB releases them as separate record-level tables; category 1839 holds the per-sample fields 30900–30902 (proteins measured, plate, well). `PPP_PLATE_ADJUSTED_IMPUTE1_3K.Rds` holds 2,919 proteins at instance 0 (48,581 participants) and instance 2 (1,160). It was made outside this repository:
+- **Olink:** NPX values are not individual Showcase fields. UKB releases them as separate record-level tables; category 1839 holds the per-sample fields 30900–30902 (proteins measured, plate, well). `PPP_PLATE_ADJUSTED_IMPUTE1_3K.Rds` is a data frame with one row per participant and visit (49,741 rows): `individual_id`, `instance_id` and one numeric column per protein (layout below). It holds 2,919 proteins at instance 0 (48,581 participants) and instance 2 (1,160, of whom 1,117 also have instance 0). It was made outside this repository:
   - Quality control followed Sethi, Raj, Wright and Melamud, [*Plasma Proteomic Determinants of Common Causes of Mortality*](https://doi.org/10.21203/rs.3.rs-2626017/v1) (Research Square preprint, 2023), which follows Sun et al. 2022 ([bioRxiv 2022.06.17.496443](https://doi.org/10.1101/2022.06.17.496443)): NPX values as reported by Olink, with measurements that failed plate QC or sample QC removed, and proteins missing in most samples removed. That paper used the first release of 1,472 proteins; this file covers the full 2,919-protein release.
-  - Plate effects were removed for each protein by regressing NPX on Olink plate ID.
-  - Missing values were then imputed using mice lasso regression; the resulting dataset contains no missing values.
+  - Plate effects were removed for each protein by regressing NPX on Olink plate ID. The values are the residuals, in NPX units (log2): every protein has mean 0, with standard deviations from 0.70 to 1.01. Section 3 z-scales them with the other biomarkers.
+  - Missing values were then imputed with the MICE implementation of the Python package fancyimpute (0.3.3): each protein with missing values is regressed on all other columns by Bayesian ridge regression and its missing values redrawn from the posterior predictive distribution, for 40 burn-in rounds, and the average of the next 10 rounds is kept as a single completed dataset. The resulting file contains no missing values. `preprocess_UKBB.Rmd` has an R port of this step, `imputeMICE()`.
+  - Protein columns are named by Olink assay symbol in upper case (`NPPB`, `TNNI3`, …), and these are the biomarker names used in the analysis. They cover the eight Olink Explore 3072 panels: Cardiometabolic, Inflammation, Neurology, Oncology and their `_II` extensions, with 363–368 proteins each. TNF, IL6 and CXCL8 are measured on all four panels of the first release, and LMOD1, SCRIB and IDO1 on all four `_II` panels; the file has one column for each. Four assays of the release, PCOLCE, NPM1, CST1 and GLIPR1, are not in the file.
 - **Scaling:** all biomarkers are z-scaled across participants before fitting (section 3).
 
 <details>
@@ -443,6 +444,20 @@ These fields are extracted but not used in any model:
 | [23646](https://biobank.ndph.ox.ac.uk/showcase/field.cgi?id=23646) | Cholesteryl Esters to Total Lipids in Small HDL percentage | `cholesteryl_esters_to_total_lipids_in_small_hdl_percentage` |
 | [23647](https://biobank.ndph.ox.ac.uk/showcase/field.cgi?id=23647) | Free Cholesterol to Total Lipids in Small HDL percentage | `free_cholesterol_to_total_lipids_in_small_hdl_percentage` |
 | [23648](https://biobank.ndph.ox.ac.uk/showcase/field.cgi?id=23648) | Triglycerides to Total Lipids in Small HDL percentage | `triglycerides_to_total_lipids_in_small_hdl_percentage` |
+
+</details>
+
+<details>
+<summary>Layout of <code>PPP_PLATE_ADJUSTED_IMPUTE1_3K.Rds</code> (made-up values)</summary>
+
+| individual_id | instance_id | NPPB | TNNI3 | HNRNPK | … |
+|---|---|---|---|---|---|
+| 1000001 | 0 | -0.214 | 0.537 | -1.102 | … |
+| 1000002 | 0 | 1.380 | -0.065 | 0.249 | … |
+| 1000003 | 2 | 0.072 | -0.818 | 0.613 | … |
+| … | … | … | … | … | … |
+
+49,741 rows × 2,921 columns: the two ID columns and 2,919 protein columns, one row per participant and visit.
 
 </details>
 
