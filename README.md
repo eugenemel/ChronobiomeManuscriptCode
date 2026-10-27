@@ -53,3 +53,7 @@ It also reads three files from the serial-sampling Olink study (the Chronobiome 
 
 - `2025-09-17_Common-chronobiome-and-ukbb-cyclers_Sample-metadata_AB-proteomics_Plasma_NPX-values.txt` (sample metadata) and `2025-09-17_All-protein-assays_Feature-matrix_AB-proteomics_Plasma_NPX-values.txt` (NPX values). These are subject-level data and are not included in the repository; they can be requested from the corresponding authors of the Chronobiome study.
 - `Cosinor-lmer_Fit-across-all-samples_Olink_Plasma_Proteomics.txt`: the cosinor fit of each protein in the serial study. This summary file is included. The main notebook also reads it, for the mortality model (section 13.4) and the comparison in section 14.9.
+
+## License
+
+The code is released under the [MIT License](LICENSE). `imputeMICE()` in `preprocess_UKBB.Rmd` is translated from the MICE implementation in [fancyimpute](https://github.com/iskandr/fancyimpute) (Apache License 2.0). The license covers the code only: UK Biobank and Chronobiome data are not included and are available from their providers under their own terms.

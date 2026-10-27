@@ -666,6 +666,7 @@ saveRDS(age_at_menopause, "preprocessed/age_at_menopause.Rds")
 `PPP_PLATE_ADJUSTED_IMPUTE1_3K.Rds` was made outside this notebook (SPEC.md section 2.3). After plate adjustment, its missing NPX values were imputed by a Python script with the MICE implementation of fancyimpute 0.3.3, `MICE(n_burn_in = 40, n_imputations = 10)`. `imputeMICE()` is an R port of that script, with the same algorithm and defaults; on simulated data it agrees with the original up to the random draws. With all ~2,900 proteins, each round refits ~2,900 regressions on ~48,000 rows: that takes about 9 days per round with R's default reference BLAS, so link R to an optimized BLAS (on macOS, Apple's vecLib) before running it on the full panel.
 
 ```{r impute_mice}
+# Translated from fancyimpute's MICE (https://github.com/iskandr/fancyimpute), Apache License 2.0.
 # fancyimpute MICE with the defaults the script used:
 #   - columns are visited from most to least missing; complete columns are only used as predictors
 #   - missing values start as the column mean of the observed values
