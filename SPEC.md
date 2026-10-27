@@ -61,8 +61,8 @@ The analysis uses one assessment visit at a time, chosen by `params$instance` in
 | `PPP_PLATE_ADJUSTED_IMPUTE1_3K.Rds` | UKB-PPP Olink NPX values, 2,919 proteins | outside this repository |
 | `UKBB_BaselineCovariates.Rds` | fields 21003, 31, 189, 1239, 20161, 1558, 21001, 53 | `preprocess_UKBB.Rmd` |
 | `UKBB_HealthRating.Rds` | field 2178 | `preprocess_UKBB.Rmd` |
-| `UKBB_SLEEP.Rds` | fields 1160, 1170, 1180, 1190, 1200, 1210, 1220 | outside this repository |
-| `age_at_menopause.Rds` | field 3581 | outside this repository |
+| `UKBB_SLEEP.Rds` | fields 1160, 1170, 1180, 1190, 1200, 1210, 1220 | `preprocess_UKBB.Rmd` |
+| `age_at_menopause.Rds` | field 3581 | `preprocess_UKBB.Rmd` |
 | `UKBB_PrevCond.Rds` | fields 2443, 2453, 2966, 3627, 3761, 3786, 3894, 4012, 4022, 4056 (instance 0) | `preprocess_UKBB.Rmd` |
 | `ALLEVENTS.Rds` | first occurrences, cancer and death registries, hospital inpatient records (section 2.4) | `preprocess_UKBB.Rmd` |
 

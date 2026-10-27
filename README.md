@@ -31,7 +31,7 @@
 
 ### 1. Preprocess UK Biobank
 
-`preprocess_UKBB.Rmd` builds the data tables in `preprocessed/` from the record-level data and the hospital and death tables. Three of the inputs were made outside this repository: the Olink protein file `PPP_PLATE_ADJUSTED_IMPUTE1_3K.Rds`, `UKBB_SLEEP.Rds` and `age_at_menopause.Rds`. SPEC.md section 2.1 lists every input file and its UKB fields. Individual-level data are not included in this repository.
+`preprocess_UKBB.Rmd` builds the data tables in `preprocessed/` from the record-level data and the hospital and death tables. The one input made outside this repository is the Olink protein file `PPP_PLATE_ADJUSTED_IMPUTE1_3K.Rds` (SPEC.md section 2.3 describes how). SPEC.md section 2.1 lists every input file and its UKB fields. Individual-level data are not included in this repository.
 
 
 ### 2. Main analysis: `ChronobiomeUKBB.Rmd`

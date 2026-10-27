@@ -628,3 +628,35 @@ PULSE <- get_field(fld_id = 102) %>% select(individual_id, instance_id, value)  
 BloodPreasure <- SBP %>% left_join(DBP) %>% left_join(PULSE)
 saveRDS(BloodPreasure, "preprocessed/UKBB_BloodPressure.Rds")
 ```
+
+```{r sleep}
+# Extract sleep questionnaire fields (category 100057)
+# Sleep duration (1160) and chronotype (1180) are covariates in the analysis; chronotype is also
+# the exposure in section 15. Getting up (1170), napping (1190), sleeplessness (1200),
+# snoring (1210) and daytime dozing (1220) are stored but not used.
+# One row per individual/instance with a sleep duration answer
+sleepduration <- get_field(fld_id = 1160) %>% select(individual_id, instance_id, sleepduration = value)
+get_up_time <- get_field(fld_id = 1170) %>% select(individual_id, instance_id, get_up_time = value)
+chronotype <- get_field(fld_id = 1180) %>% select(individual_id, instance_id, chronotype = value)
+daynap <- get_field(fld_id = 1190) %>% select(individual_id, instance_id, daynap = value)
+insomnia <- get_field(fld_id = 1200) %>% select(individual_id, instance_id, insomnia = value)
+snoring <- get_field(fld_id = 1210) %>% select(individual_id, instance_id, snoring = value)
+dozing <- get_field(fld_id = 1220) %>% select(individual_id, instance_id, dozing = value)
+
+SLEEP <- sleepduration %>%
+  left_join(get_up_time, by = c("individual_id", "instance_id")) %>%
+  left_join(chronotype, by = c("individual_id", "instance_id")) %>%
+  left_join(daynap, by = c("individual_id", "instance_id")) %>%
+  left_join(insomnia, by = c("individual_id", "instance_id")) %>%
+  left_join(snoring, by = c("individual_id", "instance_id")) %>%
+  left_join(dozing, by = c("individual_id", "instance_id"))
+saveRDS(SLEEP, "preprocessed/UKBB_SLEEP.Rds")
+```
+
+```{r menopause}
+# Extract age at menopause (last menstrual period, field 3581)
+# Asked only of women who reported having been through menopause; one row per individual/instance
+# at which it was answered. Used for post-menopause status in section 15.5.
+age_at_menopause <- get_field(fld_id = 3581) %>% select(individual_id, instance_id, age_at_menopause = value)
+saveRDS(age_at_menopause, "preprocessed/age_at_menopause.Rds")
+```
