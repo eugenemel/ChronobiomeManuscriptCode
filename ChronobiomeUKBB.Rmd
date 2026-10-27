@@ -1,0 +1,2240 @@
+---
+title: "UKB Chronobiome Analysis"
+output:
+  html_document:
+    df_print: paged
+editor_options:
+  chunk_output_type: inline
+params:
+  censor_date: "2023-09-01" # latest event date
+  instance: 0 # UKBB visit: 0 = baseline assessment, 1 = repeat assessment, 2 = first imaging visit
+---
+
+# 1. Load Libraries and Data
+
+This section loads the required R packages for data manipulation, visualization, and statistical modeling. It also loads the preprocessed datasets for the analysis.
+
+```{r load-packages, message=FALSE, warning=FALSE}
+library(dplyr)
+library(ggplot2)
+library(mgcv)
+library(parallel)
+library(doParallel)
+
+# checkpoint files for the selected visit: baseline (instance 0) keeps the plain file names
+CHECKPOINT_SUFFIX <- if (params$instance == 0) "" else paste0("_instance", params$instance)
+```
+
+## 1.1. Load Data
+
+This chunk loads the various datasets used in the analysis, including UK Biobank baseline covariates, pre-existing conditions, health ratings, and biomarker data (proteins, blood samples, CBC, clinical chemistry, and lipids).
+
+```{r load-data}
+UKBB <- readRDS("preprocessed/UKBB_BaselineCovariates.Rds")
+
+#binarize smoking 
+# smoking: UKB field 1239 (current tobacco smoking), stored as 1 = No, 2 = Only occasionally,
+# 3 = Yes, on most or all days, 4 = Prefer not to answer -> binary current smoker (NA if not answered)
+UKBB$smoking <- ifelse(UKBB$smoking == 4, NA, as.numeric(UKBB$smoking %in% c(2, 3)))
+
+
+PREV_CONDITIONS <- readRDS("preprocessed/UKBB_PrevCond.Rds")
+HEALTH_RATING <- readRDS("preprocessed/UKBB_HealthRating.Rds")
+SLEEP <- readRDS("preprocessed/UKBB_SLEEP.Rds")
+
+# chronotype as a covariate: unordered factor, with non-answers kept as their own levels
+# so they are not dropped from every model (section 15 recodes its own copy without them)
+SLEEP <- SLEEP %>% mutate(
+  chronotype = factor(
+    case_when(
+      chronotype == "Definitely a 'morning' person"          ~ "morning",
+      chronotype == "More a 'morning' than 'evening' person" ~ "more_morning",
+      chronotype == "More an 'evening' than a 'morning' person" ~ "more_evening",
+      chronotype == "Definitely an 'evening' person"         ~ "evening",
+      chronotype == "Do not know"                            ~ "do_not_know",
+      TRUE ~ "unknown"  # Prefer not to answer or empty
+    ),
+    levels = c("morning", "more_morning", "more_evening", "evening", "do_not_know", "unknown")
+  )
+)
+
+
+## Biomarkers
+PROTEINS <- readRDS("preprocessed/PPP_PLATE_ADJUSTED_IMPUTE1_3K.Rds")
+BLOODSAMPLES <- readRDS("preprocessed/UKBB_BLOODSAMPLES.Rds")
+BLOODSAMPLES$storagetime <- (max(BLOODSAMPLES$timestamp, na.rm = TRUE) - BLOODSAMPLES$timestamp) / 1e8
+BLOODSAMPLES$hour <- as.double(format(as.POSIXct(BLOODSAMPLES$timestamp), format = "%H"))
+BLOODSAMPLES$minute <- as.double(format(as.POSIXct(BLOODSAMPLES$timestamp), format = "%M"))
+BLOODSAMPLES$second <- as.double(format(as.POSIXct(BLOODSAMPLES$timestamp), format = "%S"))
+BLOODSAMPLES$hourminute <- BLOODSAMPLES$hour + BLOODSAMPLES$minute / 60 + BLOODSAMPLES$second / 3600
+
+CBC <- readRDS("preprocessed/UKBB_CBC.Rds")
+BIOMARKER <- readRDS("preprocessed/UKBB_Biomarkers.Rds")
+LIPIDS <- readRDS("preprocessed/UKBB_Lipids.Rds") %>%
+  select(-c("albumin", "apolipoprotein_b", "creatinine", "glucose", "hdl_cholesterol"))
+
+BIOMARKER_NAMES <- bind_rows(
+  data.frame(biomarker = colnames(CBC), type = "CBC"),
+  data.frame(biomarker = colnames(BIOMARKER), type = "ChemPanel"),
+  data.frame(biomarker = colnames(PROTEINS), type = "Protein"),
+  data.frame(biomarker = colnames(LIPIDS), type = "Lipids")
+)
+
+BIOMARKER_NAMES <- BIOMARKER_NAMES %>% filter(!biomarker %in% c("individual_id", "instance_id"))
+```
+
+
+## 1.2. Plot Blood Draws
+
+Histogram of blood-draw times (`figures/blood_draw_times.pdf`).
+
+```{r plot-blood-draws, fig.width=8, fig.height=4, fig.dpi=600}
+pdf("figures/blood_draw_times.pdf", width = 8, height = 4)
+BLOODSAMPLES %>%
+  group_by(visit = round(BLOODSAMPLES$hourminute, 1)) %>%
+  tally() %>%
+  filter(visit > 7.8) %>%
+  ggplot(., aes(visit, n)) +
+  geom_bar(stat = "identity",colour = "#377EB8") +
+  #use bold font for axis text
+  theme_bw(base_size = 18) + 
+  labs(x = "Hour", y = "Subject Count");
+dev.off()
+```
+
+# 2. Setup Model Dataframe
+
+This section creates the main dataframe for modeling. It joins the different datasets, filters for relevant data, and creates new variables to indicate the presence of different biomarker panels.
+
+```{r setup-model-dataframe}
+X <- BLOODSAMPLES %>%
+  left_join(CBC) %>%
+  left_join(BIOMARKER) %>%
+  left_join(HEALTH_RATING) %>%
+  left_join(PROTEINS) %>%
+  left_join(LIPIDS, by = c("individual_id", "instance_id")) %>%
+  left_join(UKBB) %>%
+  left_join(SLEEP) %>%
+  filter(instance_id == params$instance) %>%
+  filter(!is.na(sex)) %>%
+  filter(!is.na(hourminute)) %>%
+  filter(hourminute > 9.00 & hourminute < 20.00)
+
+X$hasCBC <- ifelse(!is.na(X$lymphocyte_count), 1, 0)
+X$hasOlink <- ifelse(!is.na(X$IL6), 1, 0)
+X$hasLipids <- ifelse(!is.na(X$leucine), 1, 0)
+X$hasClinical <- ifelse(!is.na(X$cystatin_c), 1, 0)
+X$hasBiomarkerData <- X$hasCBC | X$hasOlink | X$hasLipids | X$hasClinical
+
+# Eliminate people with mostly empty data
+X <- X[X$hasBiomarkerData, ]
+
+# Clean up (optional)
+# rm(PROTEINS, LIPIDS, CBC, BIOMARKER, UKBB, PREV_CONDITIONS, HEALTH_RATING)
+```
+
+
+## 2.1. Plot Health Ratings
+
+This chunk visualizes the distribution of self-reported health ratings (Excellent, Good, Fair, Poor) stratified by sex.
+
+```{r plot-health-ratings}
+pdf("figures/health_ratings.pdf", width = 8, height = 4);
+tmp <- X %>%
+  group_by(health_rating, sex) %>%
+  filter(health_rating %in% c("Excellent", "Good", "Fair", "Poor")) %>%
+  tally()
+ mycolors <- c("#E41A1C", "#377EB8")
+ 
+      
+ggplot(tmp, aes(x = health_rating, y = n, fill = sex, label = n, group = sex)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  theme_bw(base_size = 18) +
+  scale_fill_manual(values = rev(mycolors)) +
+  labs(main = "Distribution Of Self-Reported Health Ratings", y = "N Subjects", x = "Health Rating") +
+  geom_text(angle = 0, position = position_dodge(width = 1), vjust = -0.2) +
+  theme(legend.position = "inside", legend.position.inside = c(0.8, 0.8))
+    
+dev.off()
+gc()
+```
+
+# 3. Z-scale Biomarkers
+
+This chunk z-scales all biomarker columns in the dataframe. Z-scaling standardizes the biomarkers to have a mean of 0 and a standard deviation of 1, which is important for comparing their relative effects in the models.
+
+```{r z-scale-biomarkers}
+# z-scale all BIOMARKERS
+for (biomarker in BIOMARKER_NAMES$biomarker) {
+  if (!biomarker %in% colnames(X)) {
+    next
+  }
+  missing <- is.na(X[, biomarker])
+  X[!missing, biomarker] <- as.double(scale(X[!missing, biomarker], scale = TRUE))
+}
+```
+
+# 4. Save and Restore State
+
+This section handles saving and restoring the processed dataframe to avoid re-running the preprocessing steps. It also cleans up column names to be valid R variable names.
+
+## 4.1. Save State
+
+Makes biomarker names valid R names and saves `X` and `BIOMARKER_NAMES` to `outputs/savedX.Rdata` (`outputs/savedX_instanceN.Rdata` for instance N > 0).
+
+```{r save-restore-state}
+## Fix name issues
+badchars <- "\\-|\\+|\\.|\\*|\\%|\\&|\\!|\\(|\\]|\\]"
+badnames <- grep(badchars, colnames(X))
+colnames(X)[badnames] <- gsub(badchars, "_", colnames(X)[badnames])
+colnames(X)[colnames(X) == "3_hydroxybutyrate"] <- "nmr_3_hydroxybutyrate"
+
+badnames <- grep(badchars, BIOMARKER_NAMES$biomarker)
+BIOMARKER_NAMES$biomarker[badnames] <- gsub(badchars, "_", BIOMARKER_NAMES$biomarker[badnames])
+BIOMARKER_NAMES$biomarker[BIOMARKER_NAMES$biomarker == "3_hydroxybutyrate"] <- "nmr_3_hydroxybutyrate"
+
+# Save the workspace
+#save(list = c("X", "BIOMARKER_NAMES"), file = "outputs/savedX_noZscaling.Rdata")
+save(list = c("X", "BIOMARKER_NAMES"), file = paste0("outputs/savedX", CHECKPOINT_SUFFIX, ".Rdata"))
+```
+
+## 4.2. Restore Previous State (restart here)
+
+Start here in a new session: loads the checkpoint, drops empty biomarkers, loads the saved spline fits if they exist, and sets the FDR threshold.
+
+```{r restart-here}
+library(dplyr)
+library(ggplot2)
+library(mgcv)
+library(parallel)
+library(doParallel)
+
+# same checkpoint naming as section 1, for restarting here without rerunning it
+CHECKPOINT_SUFFIX <- if (params$instance == 0) "" else paste0("_instance", params$instance)
+load(paste0("outputs/savedX", CHECKPOINT_SUFFIX, ".Rdata"))
+
+EmptyColumns <- names(which(colSums(!is.na(X)) == 0))
+BIOMARKER_NAMES <- BIOMARKER_NAMES %>% filter(!biomarker %in% EmptyColumns)
+X <- X %>% select(!any_of(EmptyColumns))
+
+#load save gam fits if they exist 
+OBSERVED_FILE <- paste0("outputs/saveOBSERVED", CHECKPOINT_SUFFIX, ".Rds")
+if(file.exists(OBSERVED_FILE)){
+  ALL <- readRDS(OBSERVED_FILE)
+  OBSERVED <- readRDS(OBSERVED_FILE)
+} else {
+  ALL <- data.frame()
+  OBSERVED <- data.frame()
+}
+
+#emperical 1% FDR based spline ln(F-statistic) threshold for healthy individual, derived in simulatios
+FDRLINE <- list()
+FDRLINE$fdr01 <- 6
+```
+
+# 5. Load Functions and Event Data
+
+Sources the fitting and plotting functions in `ChronoFunctions.R`, loads covariates, prior conditions, health ratings and disease events, and sets the end of follow-up (`params$censor_date`).
+
+```{r fitting-functions}
+source("ChronoFunctions.R")
+UKBB <- readRDS("preprocessed/UKBB_BaselineCovariates.Rds")
+PREV_CONDITIONS <- readRDS("preprocessed/UKBB_PrevCond.Rds")
+HEALTH_RATING <- readRDS("preprocessed/UKBB_HealthRating.Rds")
+EVENTS <- readRDS("preprocessed/ALLEVENTS.Rds")
+
+# fixed end of follow-up: individuals without an event are censored here (or at death)
+CENSOR_DATE <- as.Date(params$censor_date)
+if (CENSOR_DATE != max(EVENTS$date)) {
+  warning("params$censor_date (", CENSOR_DATE, ") differs from the latest event date in ALLEVENTS.Rds (", max(EVENTS$date), ")")
+}
+```
+
+# 6. Test Plots
+
+This section generates some example plots to test the fitting and plotting functions.
+
+```{r test-plots}
+plotGamFit("testosterone")
+plotGamFit("phosphate")
+```
+
+# 7. Compute Biomarker Spline Profiles
+
+This section computes the spline profiles for all biomarkers, stratified by health status and sex. The results are saved to an RDS file.
+
+```{r fit-splines}
+
+# forked workers share X with this session (no per-worker copies, nothing to export or stop);
+# used by every foreach block below
+registerDoParallel(cores = 6)
+OBSERVED <- foreach(bm = BIOMARKER_NAMES$biomarker, .combine = rbind) %dopar% {
+  library(mgcv)
+  library(broom)
+  library(dplyr)
+  gamwrap(bm)
+}
+
+# OBSERVED <- data.frame()
+# for (bm in BIOMARKER_NAMES$biomarker) {
+#   print(bm)
+#   tmp <- gamwrap(bm) # fit
+#   OBSERVED <- rbind(OBSERVED, tmp)
+# }
+
+OBSERVED$cycling <- "Observed" # label dataset as observed data
+saveRDS(OBSERVED, file = paste0("outputs/saveOBSERVED", CHECKPOINT_SUFFIX, ".Rds"))
+```
+
+
+## 7.1. Plot FDR Heatmap
+
+This chunk generates a heatmap to visualize the number and fraction of oscillatory biomarkers at a 1% False Discovery Rate (FDR) across different populations and biomarker types.
+
+```{r plot-fdr-heatmap}
+tmp <- OBSERVED %>%
+  left_join(BIOMARKER_NAMES) %>%
+  group_by(population, type) %>%
+  summarise(
+    N = max(n),
+    nbiomarkers = n(),
+    fdr001 = sum(statistic >= 6),
+    frac = fdr001 / nbiomarkers
+  )
+
+pdf("figures/fdr_counts_frac.pdf", width = 8, height = 5)
+ggplot(tmp, aes(x = type, y = population, fill = fdr001, label = paste0(fdr001, " (", round(frac * 100), "%)"))) +
+  geom_tile() +
+  geom_label(aes(size = 28)) +
+  scale_fill_gradient(low = "white", high = "lightblue", name = "Count") +
+  theme_minimal(base_size = 16) +
+  theme(legend.position = "none") +
+  labs(title = "Number (%) of Oscillatory Biomakers at 1% FDR", xlab = "Biomarker Type", ylab = "")
+dev.off()
+
+OBSERVED %>%
+  left_join(BIOMARKER_NAMES) %>%
+  group_by(population, type) %>%
+  summarise(median(n)) %>%
+  View()
+```
+
+## 7.2. Plot Healthy Individuals
+
+This section generates plots for biomarkers in healthy individuals, comparing men and women.
+
+```{r plot-healthy-individuals}
+pdf("figures/healthy_men_vs_women_range_examples.pdf", width = 8, height = 10)
+SELECTED <- OBSERVED %>%
+  filter(population == "good_health_all" & statistic > FDRLINE$fdr01) %>%
+  arrange(desc(range)) %>%
+  select(biomarker) %>%
+  head(32)
+PLOTS <- plotBiomarkerSet(head(SELECTED$biomarker, 32))
+ggpubr::ggarrange(plotlist = PLOTS, ncol = 4, nrow = 8)
+dev.off()
+
+pdf("figures/healthy_men_vs_women_range_selected.pdf", width = 8, height = 10)
+SELECTED <- c("PGF", "FGF21", "FGF19", "PDGFB", "PDGFA", "EGF", "POMC", "PRL", "PTH", "EDN1", "EPO", "GCG", "GRP", "GIP", "GDF15", "TSHB", "PPY", "SPON2", "ANGPTL1", "ANGPTL2")
+PLOTS <- plotBiomarkerSet(SELECTED)
+ggpubr::ggarrange(plotlist = PLOTS)
+dev.off()
+```
+
+
+## 7.3. Plot Chemistry Panel by Health Status
+
+This section generates plots for biomarkers in the chemical panel, stratified by health status.
+
+```{r unhealthy}
+selectedset=BIOMARKER_NAMES %>% filter(type == "ChemPanel")
+pdf("figures/chem_panel.pdf", width = 8, height = 10)
+PLOTS <- plotBiomarkerSet(selectedset$biomarker, healthStratifed = T)
+ggpubr::ggarrange(plotlist = PLOTS, ncol = 4, nrow = 8)
+dev.off()
+```
+
+
+## 7.4. Compare to Second Visit
+
+This chunk compares the Daytime Amplitudes of biomarkers between the baseline and second visits to assess the stability of the measurements.
+
+```{r compare-second-visit}
+BASELINE <- readRDS("outputs/saveOBSERVED.Rds")
+VISIT1 <- readRDS("outputs/saveOBSERVED_instance1.Rds")
+tmp <- VISIT1 %>%
+  left_join(BASELINE, suffix = c("v1", "v0"), by = c("biomarker", "population")) %>%
+  filter(population %in% c("good_health_males", "good_health_females")) %>%
+  arrange(p.valuev0)
+
+pdf("figures/baseline_vs_second_visit.pdf", width = 7, height = 11)
+ggplot(tmp, aes(rangev0, rangev1, label = biomarker)) +
+  geom_point() +
+  theme_bw(base_size = 16) +
+  ggrepel::geom_label_repel(size = 2.5, max.overlaps = 15) +
+  labs(
+    x = "Daytime Amplitude Baseline Visit (~2008-2010)",
+    y = "Daytime Amplitude Second Visit (~2012-2013)",
+    title = "Daytime Amplitudes Baseline vs. Second Visit"
+  ) +
+  facet_wrap(~population, nrow = 2) +
+  geom_smooth(method = "lm", formula = "y ~ x-1") + 
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey40") 
+dev.off()
+
+
+###--- reviewer
+# y ~ x - 1 matches the geom_smooth formula above; r2 is uncentered
+DEV <- tmp %>%
+  filter(population %in% c("good_health_males", "good_health_females"), statisticv0 >= 0) %>%
+  group_by(population) %>%
+  fit_deviation("rangev0", "rangev1", through_origin = TRUE)
+
+deviation_summary <- DEV %>%
+  group_by(population) %>%
+  summarise(
+    n              = n(),
+    slope          = first(slope),
+    r2_origin      = first(r2),                               # from y ~ x - 1
+    r_pearson      = cor(rangev0, rangev1),                   # matches r_p in main text
+    r2_pearson     = cor(rangev0, rangev1)^2,
+    median_rel_dev = median(rel_dev),
+    pct_beyond_10  = 100 * mean(rel_dev >  0.10),
+    .groups = "drop"
+  )
+print(deviation_summary)
+# A tibble: 2 × 8
+#  population              n slope r2_origin r_pearson r2_pearson median_rel_dev pct_beyond_10
+#  <chr>               <int> <dbl>     <dbl>     <dbl>      <dbl>          <dbl>         <dbl>
+#1 good_health_females   307 0.958     0.885     0.834      0.696          0.311          83.4
+#2 good_health_males     307 0.952     0.883     0.832      0.692          0.334          83.7
+
+# correlation test
+tmpM <- tmp %>% filter(population == "good_health_males")
+cor.test(tmpM$rangev0, tmpM$rangev1)
+
+tmpF <- tmp %>% filter(population == "good_health_females")
+cor.test(tmpF$rangev0, tmpF$rangev1)
+
+tmp <- VISIT1 %>% left_join(BASELINE, suffix = c("v1", "v0"), by = c("biomarker", "population"))
+tmpB <- tmp %>%
+  filter(population == "good_health_females") %>%
+  select(biomarker, matches("beta.*v0"))
+tmpV2 <- tmp %>%
+  filter(population == "good_health_females") %>%
+  select(biomarker, matches("beta.*v1"))
+
+COMPARE <- matrix(nrow = nrow(tmpB), ncol = 1)
+for (i in 1:nrow(tmpB)) {
+  hmhf <- pair_cor(tmpB, tmpV2, i)
+  COMPARE[i, ] <- c(hmhf)
+}
+COMPARE <- as.data.frame(COMPARE)
+COMPARE$biomaker <- tmpB$biomarker
+
+#remove margins, do not show x and y axis, plot each pair of splines in a 10x10 grid
+pdf("figures/spline_comparison_baseline_second_visit.pdf", width = 10, height = 10);
+par(mfrow = c(10, 10), mar = c(1, 1, 1, 1), xaxt = "n", yaxt = "n")
+plotcount=0
+for (i in 1:nrow(tmpB)) {
+  sigif <- tmp$statisticv0[i] > 6
+  if (sigif) {
+    plotcount = plotcount + 1
+    plot(1:23, scale(as.double(tmpB[i, -1])),
+      type = "l", col = "black", xlab = "", ylab = "", main = tmpB$biomarker[i], lwd = 2
+    )
+    lines(1:23, scale(as.double(tmpV2[i, -1])), type = "l", col = "red", lwd = 2)
+  }
+  if(plotcount == 100) break;
+}
+dev.off()
+```
+
+## 7.5. Plot Phosphate Biomarkers
+
+This section generates plots for biomarkers related to phosphate regulation.
+
+```{r plot-phosphate-biomarkers}
+pdf("figures/phosphate_regulators.pdf", width = 8, height = 8)
+PLOTLIST <- plotBiomarkerSet(c("phosphate", "calcium", "FGF23", "PTH", "EPO", "vitamin_d", "BMP4", "creatinine", "cystatin_c"), ylimits = c(-0.8, 0.7))
+ggpubr::ggarrange(plotlist = PLOTLIST)
+dev.off()
+
+pdf("figures/subplots_hormones.pdf", width = 4, height = 4)
+PLOTLIST <- plotBiomarkerSet(c("POMC", "PRL", "GH1", "igf_1"), ylimits = c(-0.8, 0.7))
+ggpubr::ggarrange(plotlist = PLOTLIST)
+dev.off()
+
+pdf("figures/subplots_glucogenesis.pdf", width = 4, height = 4)
+PLOTLIST <- plotBiomarkerSet(c("glucose", "pyruvate", "alanine","lactate"))
+ggpubr::ggarrange(plotlist = PLOTLIST, nrow = 2, ncol=2)
+dev.off()
+
+pdf("figures/subplots_aas.pdf", width = 4, height = 4)
+PLOTLIST <- plotBiomarkerSet(c("valine", "leucine", "isoleucine"))
+ggpubr::ggarrange(plotlist = PLOTLIST, nrow = 2, ncol=2);
+dev.off()
+
+pdf("figures/subplots_ketones.pdf", width = 4, height = 4)
+PLOTLIST <- plotBiomarkerSet(c("acetoacetate", "acetone", "nmr_3_hydroxybutyrate"))
+ggpubr::ggarrange(plotlist = PLOTLIST, nrow = 2, ncol=2)
+dev.off()
+
+pdf("figures/subplots_lipids.pdf", width = 4, height = 4)
+PLOTLIST <- plotBiomarkerSet(c("triglycerides", "average_diameter_for_hdl_particles", "total_fatty_acids","average_diameter_for_ldl_particles"))
+ggpubr::ggarrange(plotlist = PLOTLIST, nrow = 2, ncol=2)
+dev.off()
+
+pdf("figures/subplots_lipids2.pdf", width = 4, height = 4)
+PLOTLIST <- plotBiomarkerSet(c("triglycerides_in_hdl", "phospholipids_in_hdl", "triglycerides_in_ldl","phospholipids_in_ldl"))
+ggpubr::ggarrange(plotlist = PLOTLIST, nrow = 2, ncol=2)
+dev.off()
+
+pdf("figures/subplots_lipids3.pdf", width = 4, height = 4)
+PLOTLIST <- plotBiomarkerSet(c("free_cholesterol_in_hdl", "free_cholesterol_in_small_vldl", "free_cholesterol_in_ldl","free_cholesterol_in_small_vldl"))
+ggpubr::ggarrange(plotlist = PLOTLIST, nrow = 2, ncol=2)
+dev.off()
+```
+
+## 7.6. Plot Pairs Plot
+
+This chunk creates a pairs plot to visualize the correlations of Daytime Amplitudes between different health and sex groups.
+
+```{r plot-pairs}
+tmp <- reshape2::dcast(OBSERVED, biomarker ~ population, value.var = "range")
+
+# robust regression line (panel.lm) plus dashed y = x unity line
+panel.lm.unity <- function(x, y, ...) {
+  panel.lm(x, y, ...)
+  abline(a = 0, b = 1, lty = 2, lwd = 1.5, col = "grey40")
+}
+
+pdf("figures/pairs_healthy_sick.pdf", width = 12, height = 12)
+par(cex.main = 2)
+pairs(tmp[, -1],
+  lower.panel = panel.lm.unity, upper.panel = panel.cor, lwd = 1.5, pch = 19,
+  main = "Correlation of Daytime Amplitudes in Health and Sex Strata"
+)
+dev.off()
+```
+
+## 7.7. Plot Sex-Difference in Daytime Amplitudes
+
+This section plots the differences in diurnal ranges between healthy men and women, as well as between good and poor health groups.
+
+```{r plot-sex-difference}
+tmp <- reshape2::dcast(OBSERVED, biomarker ~ population, value.var = "range")
+tmp$female_male_ratio <- log2(tmp$good_health_females / tmp$good_health_males)
+
+pdf("figures/healthy_men_vs_women_range.pdf", width = 8, height = 8)
+ggplot(tmp, aes(good_health_males, good_health_females, label = biomarker)) +
+  geom_point() +
+  theme_bw(base_size = 16) +
+  ggrepel::geom_label_repel(size = 4, max.overlaps = 20) +
+  labs(
+    y = "Diurnal Range Healthy Women",
+    x = "Diurnal Range Healthy Men",
+ #   title = "Healthy Subcohort Diurnal Biomarker Range"
+  )
+dev.off()
+
+pdf("figures/good_vs_poor_all_range.pdf", width = 8, height = 8)
+ggplot(tmp, aes(good_health_all, poor_health_all, label = biomarker)) +
+  geom_point() +
+  theme_bw(base_size = 16) +
+  ggrepel::geom_label_repel(size = 4,max.overlaps = 20) +
+  labs(
+    y = "Good Health Range",
+    x = "Poor Health Range",
+#    title = "Healthy Subcohort Biomarker Range"
+  )
+dev.off()
+```
+
+# 8. Compute Sex-Specific Differences
+
+This section computes the differences in spline shapes between sexes for each biomarker.
+
+```{r compute-sex-differences}
+
+registerDoParallel(cores = 6)
+FITS <- foreach(bm = BIOMARKER_NAMES$biomarker, .combine = rbind) %dopar% {
+  library(mgcv)
+  library(broom)
+  library(dplyr)
+  testDiffSplineSex(bm)
+}
+
+sexPvalues <- FITS
+saveRDS(FITS, "outputs/saveSexPvaluesGAM.Rds")
+```
+
+## 8.1. Plot Sex-Specific Associations
+
+This chunk plots the results of the sex-specific analysis, highlighting biomarkers with significant differences in their oscillatory patterns between males and females.
+
+```{r plot-sex-specific-associations}
+sexPvalues <- readRDS("outputs/saveSexPvaluesGAM.Rds")
+sexPvaluesSlopes <- sexPvalues %>% filter(term == "s(x)")
+sexPvaluesSlopes <- sexPvaluesSlopes %>% rename(maleRange = noDiseaseRange, femaleRange = DiseaseRange)
+sexPvaluesSlopes$adj.p.value <- p.adjust(sexPvaluesSlopes$p.value, "fdr")
+sexPvaluesSlopes$female_male_ratio <- log2(sexPvaluesSlopes$femaleRange / sexPvaluesSlopes$maleRange)
+tmp <- sexPvaluesSlopes %>% arrange(adj.p.value)
+
+tmp$sig <- ifelse(tmp$adj.p.value < 0.01, "Sig", "Not Sig")
+tmp$plotLabel <- ifelse(tmp$statistic > 20 & tmp$adj.p.value < 0.0001, tmp$biomarker, "")
+mycolors <- c("black", "#E41A1C")
+
+pdf("figures/detection_of_sex_specific_effects.pdf", width = 7, height = 8)
+ggplot(tmp, aes(female_male_ratio, sumDelta, label = plotLabel, color = sig)) +
+  geom_point(alpha = 0.8) +
+  theme_bw(base_size = 18) +
+  xlab("Change in Daytime Amplitude log2(Female/Male)") +
+  ylab("Magnitude of Spline Seperation") +
+  ggrepel::geom_label_repel(size = 2.5, max.overlaps = 30) +
+  ggtitle("Detection of Sex Specific Oscillators") +
+  scale_color_manual(values = mycolors) +
+  geom_vline(xintercept = 0, linetype = "dotdash") +
+  ylim(c(0, 21)) +
+  xlim(c(-3,3)) +
+  theme(legend.position = "inside", legend.position.inside = c(0.1, 0.9))
+dev.off()
+
+SELECTED <- tmp %>%
+  filter(p.value < 1e-6 & abs(tmp$female_male_ratio) > 0.5 & sumDelta > 2) %>%
+  arrange(desc(sumDelta))
+
+
+pdf("figures/detection_of_sex_specific_effects_splines.pdf", width = 7, height = 8)
+plotset <- c("phosphate", "FGF23", "GH1", "igf_1", "testosterone", "oestradiol", "CD14", "ADM", "OGT", "LEP", "triglycerides_to_total_lipids_in_large_hdl_percentage", "ESM1", "MYLPF", "MYBPC2", "IL6", "GGT5")
+PLOTS <- plotBiomarkerSet(plotset)
+ggpubr::ggarrange(plotlist = PLOTS)
+dev.off()
+```
+
+# 9. Compute Healthy vs Sick Differences
+
+This section computes the differences in spline shapes between healthy and sick individuals.
+
+```{r functions to  compute-health-differences}
+X$poor_health <- ifelse(X$health_rating %in% c("Fair", "Poor"), 1, 0)
+
+countPPP <- sum(X$poor_health & !is.na(X$IL6))
+countCBC <- sum(X$poor_health & !is.na(X$white_blood_cell_leukocyte_count))
+countLipids <- sum(X$poor_health & !is.na(X$glucose_lactate))
+countClinical <- sum(X$poor_health & !is.na(X$cystatin_c))
+
+
+testHealthAgeSex <- function(biomarker) {
+  formula_str <- sprintf("`%s` ~ poor_health + %s", biomarker, covariateTerms())
+  healthfit <- broom::tidy(lm(as.formula(formula_str), data = X))
+  healthfit <- healthfit[-1, ]
+  healthfit$biomarker <- biomarker
+  return(healthfit)
+}
+
+testDiseaseAgeSex <- function(biomarker, diseasecases, icd10) {
+  X$event <- ifelse(diseasecases, 1, 0)
+  formula_str <- sprintf("`%s` ~ event + %s", biomarker, covariateTerms())
+  healthfit <- broom::tidy(lm(as.formula(formula_str), data = X))
+  healthfit <- healthfit[-1, ]
+  healthfit$biomarker <- biomarker
+  healthfit$icd10 <- icd10
+  return(healthfit)
+}
+
+testCoxPhDiseaseAssociation <- function(biomarker, eventdf, icd10) {
+  formula_str <- sprintf("Surv(timetoevent,event) ~ `%s` + %s", biomarker, covariateTerms(SURVIVAL_COVARIATES))
+  healthfit <- broom::tidy(coxph(as.formula(formula_str), data = eventdf))
+  healthfit <- healthfit[1, ]
+  healthfit$biomarker <- biomarker
+  healthfit$icd10 <- icd10
+  return(healthfit)
+}
+```
+
+```{r compute-health-differences}
+registerDoParallel(cores = 6)
+
+AGESEXFIT <- foreach(bm = BIOMARKER_NAMES$biomarker, .combine = rbind) %dopar% {
+  library(broom)
+  testHealthAgeSex(bm)
+}
+
+FITS <- foreach(bm = BIOMARKER_NAMES$biomarker, .combine = rbind) %dopar% {
+  library(mgcv)
+  library(broom)
+  library(dplyr)
+  testDiffSplineHealth(bm)
+}
+saveRDS(FITS, "outputs/saveHealthPvaluesGAM.Rds")
+saveRDS(AGESEXFIT, "outputs/saveAgeSexFits.Rds")
+```
+
+## 9.1. Plot Health-Specific Associations
+
+This chunk plots the results of the health-specific analysis, highlighting biomarkers with significant differences in their oscillatory patterns between healthy and sick individuals.
+
+```{r plot-health-specific-associations}
+healthPvalues <- readRDS("outputs/saveHealthPvaluesGAM.Rds")
+healthPvalues$adj.p.value <- p.adjust(healthPvalues$p.value, "fdr")
+
+AGESEXFIT <- readRDS("outputs/saveAgeSexFits.Rds")
+AGESEXFIT <- AGESEXFIT %>% filter(term == "poor_health")
+AGESEXFIT$adj.p.value_health <- p.adjust(AGESEXFIT$p.value, "fdr")
+
+tmp <- healthPvalues %>% arrange(adj.p.value)
+
+tmp$plotLabel <- ifelse(tmp$sumDelta > 3 & tmp$adj.p.value < 0.01 & tmp$statistic > 6, tmp$biomarker, "")
+tmp$sig <- ifelse(tmp$adj.p.value < 0.01 & tmp$statistic > 6, "Sig", "Not Sig")
+tmp$poor_good_ratio <- log2(tmp$DiseaseRange / tmp$noDiseaseRange)
+tmpage <- tmp %>% left_join(AGESEXFIT, by = "biomarker")
+
+mycolors <- c("black", "#E41A1C")
+
+pdf("figures/detection_of_health_specific_effects.pdf", width = 9, height = 8)
+ggplot(tmpage, aes(log(statistic.x), sumDelta, label = plotLabel, color = sig)) +
+  geom_point(alpha = 0.8) +
+  theme_bw(base_size = 16) +
+  xlab("Spline Difference log(statistic)") +
+  ylab("Magnitude of Spline Seperation") +
+  ggrepel::geom_label_repel(size = 4, max.overlaps = 20) +
+  ggtitle("Oscillatory Changes in Healthy vs Sick") +
+  scale_color_manual(values = mycolors) +
+  theme(legend.position = "inside", legend.position.inside = c(0.1, 0.9))
+dev.off()
+
+plotset <- tmp %>%
+  filter(tmp$sumDelta > 3 & tmp$adj.p.value < 0.01) %>%
+  arrange(desc(sumDelta)) %>%
+  select(biomarker) %>%
+  head(30)
+PLOTS <- plotBiomarkerSet(plotset$biomarker, healthStratifed = TRUE)
+pdf("figures/detection_of_health_related_splines.pdf", width = 6, height = 6)
+ggpubr::ggarrange(plotlist = PLOTS)
+dev.off()
+```
+
+## 9.2. Example Plot
+
+This chunk generates an example plot for a single biomarker to illustrate the difference in spline fits between healthy and sick individuals.
+
+```{r plot-health-example}
+poorhealth <- X$health_rating %in% c("Poor", "Fair")
+plotGamFitDisease("OMG",
+  adjustforSex = TRUE,
+  rowsetDisease = poorhealth, icd10 = "Poor Health"
+)
+```
+
+# 10. Disease-Specific Associations
+
+This section describes disease prevalence at baseline in the good- and poor-health groups, and counts how many future cases of each selected disease have each biomarker measured.
+
+## 10.1. Plot Disease Prevalence
+This chunk plots the prevalence of diseases in the sick vs. healthy cohorts.
+
+```{r plot-disease-prevalence}
+tmpdf <- EVENTS %>%
+  left_join(UKBB) %>%
+  left_join(HEALTH_RATING) %>%
+  filter(instance_id == 0)
+
+tmpdf$first_visit_date <- as.Date(tmpdf$first_visit_date)
+tmpdf <- tmpdf %>% filter(date <= first_visit_date)
+tmpdf$health_class <- ifelse(tmpdf$health_rating %in% c("Good", "Excellent"), "Healthy", "Sick")
+
+health_class_counts <- HEALTH_RATING %>%
+  mutate(health_class = ifelse(health_rating %in% c("Good", "Excellent"), "Healthy", "Sick")) %>%
+  filter(instance_id == 0) %>%
+  group_by(health_class) %>%
+  summarise(nclass = n())
+
+
+disease_counts <- tmpdf %>%
+  group_by(health_class, icd10) %>%
+  summarise(n = n_distinct(individual_id)) %>%
+  arrange(desc(n))
+disease_counts <- disease_counts %>% left_join(health_class_counts)
+
+disease_counts$fracDisease <- disease_counts$n / disease_counts$nclass
+plotdf <- reshape2::dcast(disease_counts,
+  icd10 ~ health_class,
+  value.var = "fracDisease",
+  fill = 0.00001
+)
+plotdf$diseaseEnrichment <- (plotdf$Sick + 0.00001) / (plotdf$Healthy + 0.00001)
+plotdf <- plotdf %>% arrange(desc(Sick))
+plotdf$plotlabel <- NA
+plotdf$plotlabel[1:30] <- plotdf$icd10[1:30]
+
+pdf("figures/disease_pravelance.pdf",
+  width = 8, height = 8
+)
+ggplot(plotdf, aes(Healthy * 10000, Sick * 10000, label = plotlabel)) +
+  geom_point() +
+  geom_abline(slope = 1) +
+  theme_bw(base_size = 16) +
+  ggtitle("Underlying Disease Prevalence at Baseline") +
+  ggrepel::geom_label_repel() +
+  xlab("Prevalence in Good & Excellent (per 10K)") +
+  ylab("Prevalence in Poor & Fair (per 10K)")
+dev.off()
+```
+
+```{r plot-disease-enrichment-bar}
+ICD10_DESC <- data.frame(
+  icd10 = c(
+    "E11", "I20", "I25", "E14", "Z86", "R07", "M47", "K29", "F32", "K44",
+    "R10", "K21", "E78", "M19", "F41", "F17", "I10", "K62", "J22", "K58",
+    "E03", "J45", "M54", "M79", "N39", "M25", "J06", "N92", "L30", "J30"
+  ),
+  text = c(
+    "Type 2 diabetes mellitus",
+    "Angina pectoris",
+    "Chronic ischaemic heart disease",
+    "Unspecified diabetes mellitus",
+    "Personal history of certain diseases",
+    "Pain in throat and chest",
+    "Spondylosis",
+    "Gastritis and duodenitis",
+    "Depressive episode",
+    "Diaphragmatic hernia",
+    "Abdominal and pelvic pain",
+    "Gastro-oesophageal reflux disease",
+    "Disorders of lipoprotein metabolism",
+    "Other arthrosis",
+    "Other anxiety disorders",
+    "Mental disorders due to tobacco use",
+    "Essential (primary) hypertension",
+    "Other diseases of anus and rectum",
+    "Acute lower respiratory infection",
+    "Irritable bowel syndrome",
+    "Other hypothyroidism",
+    "Asthma",
+    "Dorsalgia",
+    "Other soft tissue disorders",
+    "Other disorders of urinary system",
+    "Other joint disorders",
+    "Acute upper respiratory infections",
+    "Excessive/irregular menstruation",
+    "Other dermatitis",
+    "Vasomotor and allergic rhinitis"
+  ),
+  stringsAsFactors = FALSE
+)
+
+plotdf_bar <- plotdf %>%
+  filter(!is.na(plotlabel)) %>%
+  left_join(ICD10_DESC, by = "icd10") %>%
+  mutate(
+    ylab = ifelse(!is.na(text), paste0(icd10, " - ", text), icd10),
+    ylab = reorder(ylab, diseaseEnrichment)
+  )
+
+pdf("figures/disease_enrichment_sick_vs_healthy.pdf", width = 8, height = 7)
+ggplot(plotdf_bar, aes(x = diseaseEnrichment, y = ylab)) +
+  geom_col(fill = "#8B0000") +
+  theme_bw(base_size = 13) +
+  ggtitle("Disease Enrichment in Fair/Poor Health Subjects") +
+  xlab("Enrichment (Sick / Healthy)") +
+  ylab("ICD-10 Code") +
+  theme(axis.text.y = element_text(hjust = 1))
+dev.off()
+```
+
+## 10.2. Count Cases and Biomarker Overlaps
+
+This section counts the number of cases for selected diseases and the overlap with available biomarker data.
+
+```{r count-cases-biomarker-overlaps}
+SELECTED_DISEASES <- c(
+  "I10", "E78", "J45", "M19", "M25", "F32", "M54",
+  "M79", "K21", "E14", "I20", "J22", "R07", "J30", "K29",
+  "R10", "K44", "N39", "K58", "L30", "E03", "I25", "F17",
+  "E11", "K62", "M47", "F41", "I21", "G20", "G30", "Death"
+)
+
+casecount <- list()
+for (icd10 in SELECTED_DISEASES) {
+  casecount[[icd10]] <- getFutureEvents(icd10) # future incidence cases
+}
+
+biomarker_overlap <- matrix(nrow = length(SELECTED_DISEASES), ncol = 4)
+rownames(biomarker_overlap) <- SELECTED_DISEASES
+for (icd10 in SELECTED_DISEASES) {
+  countPPP <- sum(casecount[[icd10]] & !is.na(X$IL6))
+  countCBC <- sum(casecount[[icd10]] & !is.na(X$white_blood_cell_leukocyte_count))
+  countLipids <- sum(casecount[[icd10]] & !is.na(X$glucose_lactate))
+  countClinical <- sum(casecount[[icd10]] & !is.na(X$cystatin_c))
+  biomarker_overlap[icd10, ] <- c(countPPP, countCBC, countLipids, countClinical)
+}
+colnames(biomarker_overlap) <- c("Protein", "CBC", "Lipids", "Clinical")
+biomarker_overlap <- as.data.frame(biomarker_overlap)
+biomarker_overlap$icd10 <- rownames(biomarker_overlap)
+
+ICD10 <- readr::read_csv("support_files/ICD10.csv") %>% select(icd10 = id, text)
+biomarker_overlap <- ICD10 %>%
+  right_join(biomarker_overlap) %>%
+  arrange(desc(Protein))
+```
+
+## 10.3. Compute Disease Biomarker Coverage
+
+This chunk computes the coverage of each biomarker for each selected disease.
+
+```{r compute-disease-biomarker-coverage}
+npairs <- length(BIOMARKER_NAMES$biomarker) * length(SELECTED_DISEASES)
+biomarker_overlap_all <- data.frame(matrix(nrow = npairs, ncol = 3))
+rowCount <- 0
+for (icd10 in SELECTED_DISEASES) {
+  for (bm in BIOMARKER_NAMES$biomarker) {
+    rowCount <- rowCount + 1
+    countCases <- sum(casecount[[icd10]] & !is.na(X[, bm]))
+    biomarker_overlap_all[rowCount, ] <- c(bm, icd10, countCases)
+  }
+}
+colnames(biomarker_overlap_all) <- c("biomarker", "icd10", "count")
+saveRDS(biomarker_overlap_all, file = "outputs/biomarker_coverage.Rds")
+biomarker_coverage <- reshape2::dcast(biomarker_overlap_all, biomarker ~ icd10, value.var = "count")
+```
+
+# 11. Compute Disease Oscillatory Changes
+
+For each selected disease, this section compares diurnal splines between participants who never had the disease and two case groups: those diagnosed before the visit or within 2 years after it (prior), and those diagnosed later (future). Fits are saved to `outputs/<icd10>_splinefit.Rds` and `outputs/<icd10>_future_splinefit.Rds`.
+
+```{r model-prior-events}
+TOPDISEASES <- EVENTS %>%
+  group_by(icd10) %>%
+  tally() %>%
+  arrange(desc(n)) %>%
+  head(100)
+
+## SLOW
+for (icd10 in SELECTED_DISEASES) {
+  modelPastFutureEvents(icd10 = icd10)
+}
+```
+
+## 11.1. Plot Largest Disease Associations
+
+This chunk plots the largest disease associations with oscillatory changes.
+
+```{r plot-largest-disease-associations}
+ICD10 <- readr::read_csv("support_files/ICD10.csv") %>% select(icd10 = id, text)
+
+DISEASEFITS <- data.frame()
+for (f in list.files("outputs/", pattern = "_splinefit\\.Rds$", full.names = TRUE)) {
+  if (grepl("Death", f)) next
+  tmp <- readRDS(f)
+  tmp <- tmp %>% filter(term == "s(x)")
+  tmp <- tmp %>% left_join(BIOMARKER_NAMES)
+  tmp$adj.p.value <- p.adjust(tmp$p.value, method = "fdr")
+  DISEASEFITS <- bind_rows(DISEASEFITS, tmp)
+}
+DISEASEFITS$disease_ratio <- log2(DISEASEFITS$DiseaseRange / DISEASEFITS$noDiseaseRange)
+DISEASEFITS$sig <- ifelse(DISEASEFITS$adj.p.value < 0.01 & DISEASEFITS$statistic > 6, "Sig", "NotSig")
+DISEASEFITS <- DISEASEFITS %>% left_join(ICD10)
+
+DISEASEFITS <- DISEASEFITS %>% filter(icd10 %in% c("I10", "E78", "J45", "I20", "I25", "E78", "M25", "M79", "J45", "M79", "E11", "E14"))
+
+DISEASEFITS_PAST <- DISEASEFITS %>% filter(model == "prior_disease")
+DISEASEFITS_FUTURE <- DISEASEFITS %>% filter(model == "future_disease")
+
+topDiseaseBiomakers_FUTURE <- DISEASEFITS_FUTURE %>%
+  filter(adj.p.value < 0.01) %>%
+  group_by(model, biomarker) %>%
+  mutate(codes = paste0(icd10, collapse = ",")) %>%
+  group_by(model, biomarker, codes) %>%
+  summarise(n = n(), overallDelta = sum(sumDelta), maxDelta = max(sumDelta, na.rm = TRUE)) %>%
+  arrange(desc(n))
+
+topDiseaseBiomakers_PAST <- DISEASEFITS_PAST %>%
+  filter(adj.p.value < 0.01) %>%
+  group_by(model, biomarker) %>%
+  mutate(codes = paste0(icd10, collapse = ",")) %>%
+  group_by(model, biomarker, codes) %>%
+  summarise(n = n(), overallDelta = sum(sumDelta), maxDelta = max(sumDelta, na.rm = TRUE)) %>%
+  arrange(desc(n))
+
+
+topDiseaseBiomakers <- topDiseaseBiomakers_FUTURE %>%
+  left_join(topDiseaseBiomakers_PAST,
+    by = "biomarker", suffix = c("_future", "_past")
+  )
+
+topDiseaseBiomakers$ndisease <- topDiseaseBiomakers$n_future + topDiseaseBiomakers$n_past
+
+p1 <- ggplot(topDiseaseBiomakers, aes(maxDelta_past, maxDelta_future, label = biomarker)) +
+  geom_point() +
+  theme_bw() +
+  ggrepel::geom_label_repel()
+
+diseasea_summary <- DISEASEFITS %>%
+  group_by(model, icd10) %>%
+  summarise(
+    nsig = sum(adj.p.value < 0.01 & statistic > 6),
+    nsiglarge = sum(adj.p.value < 0.01 & statistic > 6 & sumDelta > 3),
+    nbiomarkers = n(), frac_sig = nsiglarge / nbiomarkers
+  )
+
+pdf("figures/prec_disease_biomarkers.pdf", width = 6, height = 6)
+ggplot(diseasea_summary, aes(x = reorder(icd10, -frac_sig), frac_sig * 100, fill = model)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  theme_bw(base_size = 16) +
+  theme(
+    legend.position = "inside",
+    legend.position.inside = c(0.9, 0.9)
+  ) +
+  ylab("% Biomarkers with Oscillatory Change at 1%FDR") +
+  xlab("ICD10") +
+  scale_fill_manual(values = c("#377EB8", "#E41A1C"))
+dev.off()
+```
+
+
+# 12. Diabetes
+
+This section focuses on the analysis of diabetes (ICD10 code E11), examining the oscillatory effects of pre-existing diabetes.
+
+```{r plot-diabetes-preexisting}
+#modelPastFutureEvents(icd10 = "E11")
+
+E11out = readRDS("outputs/E11_splinefit.Rds")
+E11out$adj.p.value = p.adjust( E11out$p.value, "fdr")
+E11out$sig = ifelse(E11out$adj.p.value < 0.01 & E11out$statistic >6, "sig_diff","")
+mycolors=c("black","#E41A1C");
+
+pdf("figures/preexisting_diabetes.pdf", width=9, height=8)
+p1=ggplot(E11out,aes(y=sumDelta,x=log(statistic),
+                     label=biomarker,
+                     colour = sig)) +
+  geom_point(alpha=0.9) + 
+  theme_bw(base_size = 14) + 
+  ylab("Spline Seperation") + 
+  ggrepel::geom_label_repel(size = 2,max.overlaps = 20) + 
+  ggtitle("Oscillatory Effect of Pre-existing Diabetes") + 
+  scale_color_manual(values=mycolors) + 
+  theme(legend.position = "inside", legend.position.inside = c(0.9, 0.1))
+
+print(p1)
+dev.off()
+```
+## 12.1. Future Diabetes
+
+This chunk specifically tests for associations between biomarkers and future diabetes incidence, generating plots for selected biomarkers.
+
+```{r test-disease-associations}
+icd10 = c("E11")
+diseaseRowsPast = getPriorDiseaseEvents(icd10,maxtimetoevent = 2);
+diseaseRowsFuture = getFutureEvents(icd10,mintimetoevent = 2);
+diseaseRowsNever = !diseaseRowsPast & !diseaseRowsFuture
+  
+testDiffSpline("glucose",popname=icd10,rowsA=diseaseRowsPast,rowsB=diseaseRowsNever); 
+plotGamFitDisease("glucose",icd10,diseaseRowsPast)
+
+plotset=c("glucose","GSTA1","GSTA3","SULT2A1","FABP1","LGALS4","FST","SHMT1","ANGPTL4");
+PLOTS=plotBiomarkerSet(plotset,diseaseRows = diseaseRowsPast)
+pdf("figures/preexisting_diabetes_selected.pdf",width=8,height=8);
+ggpubr::ggarrange(plotlist = PLOTS)
+dev.off()
+
+PLOTS=plotBiomarkerSet(plotset,diseaseRows = diseaseRowsPast,unadjusted = T)
+pdf("figures/preexisting_diabetes_selected_unadjusted.pdf",width=8,height=8);
+ggpubr::ggarrange(plotlist = PLOTS)
+dev.off()
+
+plotset=c("glucose","GSTA1","GSTA3","SULT2A1",
+          "FABP1","LGALS4","FST","SHMT1","ANGPTL4");
+PLOTS=plotBiomarkerSet(plotset,diseaseRows = diseaseRowsFuture)
+pdf("figures/future_diabetes_selected.pdf",width=8,height=8);
+ggpubr::ggarrange(plotlist = PLOTS)
+dev.off()
+
+#unadjusted plots
+plotset=c("glucose","pyruvate","FABP1","TSHB","total_lipids_in_large_vldl","ANGPTL4");
+for(i in 1:6) {
+  biomarker = plotset[i];
+  filename = paste0("figures/subplots_",biomarker,".pdf");
+  p0=plotGamFitDisease(biomarker,icd10,diseaseRowsPast)
+  p1=plotGamUnadjusted(biomarker,diseaseRowsPast,sexstratifed = T)
+    
+  pdf(filename,width=8,height=4);
+  print(ggpubr::ggarrange(p0,p1,nrow=1))
+  dev.off()
+}
+
+
+
+p0=plotGamFitDisease("pyruvate",icd10,diseaseRowsPast)
+p1=plotGamUnadjusted("glucose",diseaseRowsPast,sexstratifed = T)
+ggpubr::ggarrange(p0,p1,nrow=1)
+
+
+```
+## 12.2. Diabetes - Compare Past and Future
+
+This chunk compares the spline separation effects of pre-existing diabetes versus future diabetes incidence.
+
+```{r compare-diabetes-past-future}
+pastE11 =  readRDS("outputs/E11_splinefit.Rds")
+futureE11 =  readRDS("outputs/E11_future_splinefit.Rds")
+tmp=pastE11 %>% left_join(futureE11,by=c("biomarker","term")) %>% 
+  filter(term == "s(x)")
+tmp$sig = ifelse(tmp$p.value.x < 0.001 & tmp$p.value.y < 0.001, "sig_both","")
+mycolors=c("black","#E41A1C");
+
+pdf("figures/pre_vs_future_diabetes.pdf",width=9,height=8);
+p1=ggplot(tmp,aes(x=sumDelta.x,y=sumDelta.y,label=biomarker,color=sig)) + 
+  geom_point(alpha=0.9) + theme_bw(base_size = 16) + 
+  ggtitle("Existing vs Future Diabetes") + 
+  xlab("Spline Seperation - Existing") + 
+  ylab("Spline Seperation - Future") + 
+  scale_color_manual(values = mycolors) + 
+  ggrepel::geom_label_repel(size = 5,max.overlaps = 30) + 
+  theme(legend.position = "inside", legend.position.inside = c(0.9, 0.1))
+  
+print(p1);
+dev.off()
+
+```
+
+# 13. Mortality Associations
+
+This section investigates the association between biomarker oscillations and all-cause mortality.
+
+## 13.1. Biomarker ~ Survival Associations
+
+Fits Cox Proportional Hazards models to estimate the hazard ratios for biomarkers regarding mortality.
+
+```{r mortality-survival-associations}
+library(broom); 
+library(survival);
+
+icd10 = "Death"
+eventdf = getTimeToEvent(icd10); 
+if (!any(eventdf$individual_id != X$individual_id)) {  #perfect match. save RAM on join
+  X$timetoevent = eventdf$timetoevent;
+  X$event = eventdf$event
+} else { 
+  X = X %>% left_join(eventdf) %>% filter(timetoevent>2)
+}
+
+MORTALITYFIT=data.frame();
+  for(bm in BIOMARKER_NAMES$biomarker) { 
+    print(bm);
+    tmp=testCoxPhDiseaseAssociation(bm,X,icd10)
+    MORTALITYFIT = rbind(MORTALITYFIT,tmp);
+}
+saveRDS(MORTALITYFIT,"outputs/Death_coxph.Rds")
+```
+
+
+## 13.2. Compare to Chronobiome
+This chunk compares the significance of oscillatory changes (spline differences) versus mean level changes (Cox PH) in relation to mortality.
+
+```{r compare-mortality-oscillations-levels}
+#modelFutureDesease("Death")
+DeathOut = readRDS("outputs/Death_future_splinefit.Rds") %>% filter(term=="s(x)")
+MORTALITYFIT = readRDS("outputs/Death_coxph.Rds")
+
+DeathOut=DeathOut %>% left_join(
+  MORTALITYFIT %>% select(biomarker,event_effect=estimate,event_pvalue=p.value)) 
+
+DeathOut$adj.p.value=p.adjust( DeathOut$p.value, "fdr")
+DeathOut$adj.event_pvalue=p.adjust( DeathOut$event_pvalue, "fdr")
+ 
+DeathOut$SigSplineDiff = ifelse(DeathOut$adj.p.value<0.01,"sig",
+                                "not_sig")
+DeathOut$SigLevelDiff = ifelse(DeathOut$adj.event_pvalue<0.01,"sig_level_diff",
+                               "not_sig_level")
+
+DeathOut=DeathOut %>% mutate(sig=case_when(
+     adj.p.value < 0.01 & adj.event_pvalue >= 0.01  ~ "Only Spline",
+     adj.p.value >= 0.01 & adj.event_pvalue < 0.01 ~   "Only Level",
+     adj.p.value >= 0.01 & adj.event_pvalue >= 0.01 ~  "Neither",
+     adj.p.value < 0.01 & adj.event_pvalue < 0.01 ~   "Sig Both",
+     TRUE ~ "Neither"))
+fisher.test(table(DeathOut$SigSplineDiff,DeathOut$SigLevelDiff))
+
+mycolors=c("black","#E41A1C");
+
+pdf("figures/all_cause_spline_vs_level2.pdf",width=8,height=8)
+p2=ggplot(DeathOut,aes(x=event_effect,y=sumDelta,label=biomarker,colour = SigSplineDiff)) +
+ geom_point(alpha=0.9) + 
+  theme_bw(base_size = 14) + 
+  xlab("Biomarker Mortality log(HR)") + 
+  ylab("Magnitude of Spline Seperation") + 
+  ggrepel::geom_label_repel(size = 3) + 
+  ggtitle("All-Cause Mortality") + 
+  scale_color_manual(values = mycolors) +
+  geom_vline(xintercept = 0) + 
+  theme(legend.position = "inside", legend.position.inside = c(0.9, 0.95))
+print(p2)
+dev.off()
+```
+
+## 13.3. Individual Mortality Plots
+
+Generates example spline plots for biomarkers strongly associated with mortality (e.g., GDF15, IL6).
+
+```{r plot-mortality-examples}
+icd10 = "Death"
+diseaseRows  = getFutureEvents(icd10,2);
+plotGamFitDisease("FGF21",icd10,diseaseRows)
+
+pdf("figures/all_cause_examples_levels.pdf",width=8,heigh=8)
+plotset=c("GDF15","MMP12","GFAP","HGF","EGFR","IL6","AGER","ITGAV","NEFL")
+PLOTS=plotBiomarkerSet(plotset,healthStratifed= T,diseaseRows = diseaseRows,unadjusted = T)
+ggpubr::ggarrange(plotlist = PLOTS)
+PLOTS=plotBiomarkerSet(plotset,diseaseRows = diseaseRows)
+ggpubr::ggarrange(plotlist = PLOTS)
+dev.off()
+
+plotset=c("ADM","NECTIN2","PIGR","FGF21","FABP1","OMG","DPP6",
+          "TNFSF11","ITGAV","CSF1","GFAP","NELL2")
+PLOTS=plotBiomarkerSet(plotset,healthStratifed= T,diseaseRows = diseaseRows,unadjusted = T)
+pdf("figures/all_cause_examples.pdf",width=8,heigh=8)
+ggpubr::ggarrange(plotlist = PLOTS)
+dev.off()
+```
+
+## 13.4. Cox Mortality Model
+
+Prepares a dataframe for predictive modeling of mortality, correcting biomarker levels for their circadian phase.
+
+```{r mortality_model}
+#event data
+icd10 = "Death"; 
+eventdf = getTimeToEvent(icd10); 
+
+#oscillators selection
+OlinkChronobiome <-read.csv("support_files/Cosinor-lmer_Fit-across-all-samples_Olink_Plasma_Proteomics.txt",sep="\t")
+
+#Confirmed oscillators from Chronobiome only
+selected_interaction = DeathOut %>% 
+  left_join(BIOMARKER_NAMES, by=c("biomarker" = "biomarker")) %>%
+  filter(type == "Protein") %>%
+  filter(adj.event_pvalue < 0.01 & statistic > 6) %>% #significant mortality associations
+  arrange(desc(sumDelta)) %>% 
+  head(100)
+
+#construct model dataframe
+basecov = SURVIVAL_COVARIATES
+modeldf = X %>% select("individual_id", all_of(basecov))
+modeldf = modeldf %>% left_join(eventdf);
+
+for(bm in selected_interaction$biomarker) { 
+   print(bm)
+   modeldf[, bm] = X[,bm]; #raw
+}
+
+modeldf = na.omit(modeldf); 
+#must have health rating
+modeldf = modeldf  %>% filter(health_rating %in% c("Excellent","Good","Fair","Poor"))
+modeldf$health_rating=factor(modeldf$health_rating, c("Excellent", "Good", "Fair", "Poor"))
+modeldf = modeldf %>% filter(!is.na(timetoevent) & timetoevent>2); #at least two years out
+modeldf$storagetime = as.double(modeldf$storagetime)
+
+#handle extreme values of biomarkers
+for (bm in selected_interaction$biomarker) { 
+    modeldf[is.na(modeldf[, bm]), bm] = 0; 
+    q01 = quantile(modeldf[, bm], 0.01, na.rm = TRUE)
+    q99 = quantile(modeldf[, bm], 0.99, na.rm = TRUE)
+    modeldf[ modeldf[, bm] < q01, bm] = q01
+    modeldf[ modeldf[, bm] > q99, bm] = q99
+}
+set.seed(2026) # reproducible train/test split
+train_index = sample(1:nrow(modeldf), 0.7*nrow(modeldf))
+test_index = setdiff(1:nrow(modeldf),train_index)
+dim(modeldf)
+```
+
+
+## 13.5. Compare Models
+
+This chunk performs a sensitivity analysis by iteratively adding top oscillating biomarkers to a Cox PH model to evaluate improvements in the Concordance Index (C-Index) and define a "Time-of-Day Risk Score" (TOD-RS).
+
+```{r mortality-sensitivity-analysis}
+
+#model without biomarkers
+#calculate TOD risk score as aggregate of biomarker deviations
+library(survival)
+library(gbm3);
+SUMMARY=data.frame();
+
+modeldf$hour= as.factor(round(modeldf$hourminute));
+for(bm in selected_interaction$biomarker) { 
+    modeldf[, paste0(bm,"i")] =  modeldf[[bm]] * modeldf$hourminute;
+}
+
+best_aic = Inf;
+set.seed(2026) # reproducible GBM (bagging and cross-validation)
+for(topn in seq(1,100,10)) { 
+    biomarkerseti = head(unique(selected_interaction$biomarker),topn)
+    gbm_formula_str=sprintf("Surv(timetoevent,event) ~ %s",   paste0(c(basecov,paste0(c(biomarkerseti), "i")),collapse = "+"))
+    
+    #identify osscilators with strongest link to mortality
+    gbmfit=gbm3::gbm(as.formula(gbm_formula_str), data=modeldf[train_index,],
+                     n.trees = 200, 
+                     interaction.depth = 2, 
+                     distribution = "coxph", 
+                     shrinkage = 0.1, 
+                     verbose = FALSE, 
+                     strata=modeldf$hour[train_index], 
+                     cv=3, 
+                     train.fraction = 0.5, 
+                     bag.fraction = 0.9)
+    
+    gbmselected=summary(gbmfit) %>% as.data.frame() %>% 
+      filter(rel_inf>0.1) %>% 
+      filter(grepl("i$",var))
+    
+    biomarkerset = gbmselected$var[gbmselected$rel_inf > 0.1]
+    biomarkerset = unique(gsub("i$","",biomarkerset));
+    
+    #model 1: demographics
+    formula_str_base=sprintf("Surv(timetoevent,event) ~ %s",paste0(c(basecov),collapse = "+"))
+    formula_str_level=formula_str_base;
+    formula_str_level_interaction=formula_str_base;
+    
+    for(bm in biomarkerset) { 
+      #model 2
+      formula_str_level = paste(formula_str_level, paste0(bm), sep=" + ");
+      #model 3
+      formula_str_level_interaction = paste(formula_str_level_interaction, paste0(bm," + pspline(",bm, "*hourminute,df=2)"), sep=" + ");
+    }
+    
+    #fit the three models on the training rows; skip this topn if any fit fails
+    fits = tryCatch(list(
+        base = coxph(as.formula(formula_str_base),  data=modeldf[train_index,]),
+        level = coxph(as.formula(formula_str_level),  data=modeldf[train_index,]),
+        interaction = coxph(as.formula(formula_str_level_interaction), data=modeldf[train_index,])
+      ), error = function(e) { print(e); NULL })
+    if (is.null(fits)) next
+    coxfit_base = fits$base
+    coxfit_base_level = fits$level
+    coxfit_level_interaction = fits$interaction
+
+    #test c-index: each model's risk score ranked against outcomes in the held-out rows
+    #(summary(coxfit)$concordance is the value on the training rows the model was fitted to)
+    cindex_test = concordance(coxfit_base, coxfit_base_level, coxfit_level_interaction, newdata=modeldf[test_index,])
+    cindex_1 = unname(cindex_test$concordance[1])
+    cindex_2 = unname(cindex_test$concordance[2])
+    cindex_3 = unname(cindex_test$concordance[3])
+    gain = c(0, -1, 1) # model 3 minus model 2, with its paired standard error
+    cindex_gain = sum(gain * cindex_test$concordance)
+    cindex_gain_se = sqrt(drop(t(gain) %*% cindex_test$var %*% gain))
+    print(c(cindex_1, cindex_2, cindex_3))
+
+    #choose the number of biomarkers on training data only (AIC with the penalized df),
+    #so the test rows reported in 13.6 play no part in choosing the model
+    aic_3 = AIC(coxfit_level_interaction)
+    if (aic_3 < best_aic) { 
+      best_aic = aic_3;
+      best_topn = topn;
+      best_biomarkers = biomarkerset;
+      print(paste0("Top ",topn," oscillators: ", paste0(biomarkerset,collapse = ",")))
+      #save models, with the GBM selection behind them for panel (e) in 13.6
+      save(coxfit_base, coxfit_base_level, coxfit_level_interaction, gbmselected, best_topn, file = "outputs/best_mortality_models.RData")
+    }
+  
+    #models summaries
+    plotdf=modeldf
+    plotdf$risk_score_base=predict(coxfit_base,newdata=modeldf)
+    plotdf$risk_score_level=predict(coxfit_base_level,newdata=modeldf)
+    plotdf$risk_level_interaction=predict(coxfit_level_interaction,newdata=modeldf)
+    plotdf$TODRS= scale(plotdf$risk_level_interaction-plotdf$risk_score_level); #z-scale TOD-RS
+
+    coxfitQ=coxph(Surv(timetoevent,event) ~ TODRS+risk_score_level, data=plotdf[test_index,])
+    tidysummary = broom::tidy(coxfitQ)
+    SUMMARY=rbind(SUMMARY,
+      data.frame(
+        topn=topn,
+        select_n = nrow(gbmselected),
+        hr_TODRS=exp(tidysummary$estimate[1]),
+        sd_TODRS=tidysummary$std.error[1],
+        pvalue_TODRS=tidysummary$p.value[1],
+        cindex_base=cindex_1,
+        cindex_base_level=cindex_2,
+        cindex_level_interaction=cindex_3,
+        cindex_gain=cindex_gain,
+        cindex_gain_se=cindex_gain_se,
+        aic_level_interaction=aic_3
+      ))
+}
+
+```
+
+## 13.6. Mortality Risk Score Summary
+
+Builds the time-of-day risk score (TOD-RS), the difference between the risk scores of the interaction and level-only models from 13.5. Tests it on the held-out rows and plots the model summary (`figures/mortality_risk_score_summary.pdf`), its hazard curve (`figures/mortality_risk_score_delta.pdf`) and Kaplan-Meier curves by quintile (`figures/mortality_risk_score.pdf`).
+
+```{r mortality-risk-score-summary}
+
+#load models
+load("outputs/best_mortality_models.RData")
+
+plotdf=modeldf
+plotdf$risk_score_base=predict(coxfit_base,newdata=modeldf)
+plotdf$risk_score_level=predict(coxfit_base_level,newdata=modeldf)
+plotdf$risk_level_interaction=predict(coxfit_level_interaction,newdata=modeldf)
+    
+plotdf$TODRS= scale(plotdf$risk_level_interaction-plotdf$risk_score_level); #z-scale TOD-RS
+quantiles <- quantile(plotdf$TODRS, probs=seq(0,1,0.2), na.rm=T)
+plotdf$risk_scoreQ=cut(plotdf$TODRS,quantiles)
+levels(plotdf$risk_scoreQ)=paste0("Q", seq(1:length(levels(plotdf$risk_scoreQ))))
+   
+#model2 vs model1
+summary(coxph(Surv(timetoevent,event) ~ scale(risk_score_level-risk_score_base)+scale(risk_score_base), data=plotdf[test_index,]))
+#model3 vs model2
+summary(coxph(Surv(timetoevent,event) ~ scale(risk_level_interaction-risk_score_level)+scale(risk_score_level), data=plotdf[test_index,]))
+summary(coxph(Surv(timetoevent,event) ~ risk_scoreQ+risk_score_level, data=plotdf[test_index,]))
+summary(coxph(Surv(timetoevent,event) ~ TODRS+risk_score_level, data=plotdf[test_index,]))
+    
+pdf("figures/mortality_risk_score_summary.pdf",width=10.5,height=12)
+p0=ggplot(gbmselected,aes(x=reorder(var,rel_inf),y=rel_inf)) + 
+  geom_bar(stat="identity", fill="#377EB8") + 
+  coord_flip() + 
+  theme_bw(base_size = 12) + 
+  xlab("Biomarker") + 
+  ylab("Relative Influence") + 
+  ggtitle("(e) TOD-RS Selected Biomarkers (GBM)")
+
+  coxtidy = broom::tidy(coxfit_level_interaction); coxtidy$model="coxph";
+  coxtidy = filter(coxtidy, grepl("pspline",term));
+  
+  
+  
+#train vs test proformance
+plotdf$TODRS_ = plotdf$risk_scoreQ
+coxfitQ=coxph(Surv(timetoevent,event) ~ TODRS_+risk_score_level, data=plotdf[test_index,-1])
+print(summary(coxfitQ))
+p6=forestPlotGlmBroomUnOrder(coxfitQ,sig_cut = 1) + 
+  ggtitle("(f) Biomarker level adjusted TOD-RS (Quintiles)")
+
+##gplot summary
+p1=ggplot(SUMMARY,aes(x=topn,y=hr_TODRS)) + 
+  geom_line(size=1.5,color="#377EB8") + 
+  geom_point(size=3,color="#377EB8") + 
+  theme_bw(base_size = 14) + 
+  xlab("Number of Biomarkers Considered") + 
+  ylab("TOD-RS Hazard Ratio per SD.") + 
+  ggtitle("(c) TOD-RS Hazard Ratio") + 
+  geom_hline(yintercept=1, linetype="dashed") + 
+  scale_x_continuous(breaks = seq(0,100,10))
+
+p2 <- ggplot(SUMMARY, aes(x = topn)) +
+  geom_line(aes(y = cindex_level_interaction, colour = "Model3"), size = 1.5) +
+  geom_point(aes(y = cindex_level_interaction, colour = "Model3"), size = 3) +
+  geom_line(aes(y = cindex_base_level, colour = "Model2"), size = 1.5) +
+   geom_point(aes(y = cindex_base_level, colour = "Model2"), size = 3) +
+  geom_line(aes(y = cindex_base, colour = "Model1"), size = 1.5, linetype = "dashed") +
+  scale_colour_manual(
+    name = NULL,
+    values = c("Model1" = "#000000", "Model2" = "#30C020", "Model3" = "#377EB8"),
+    labels = c("Model1" = "Model1: Demographics",
+               "Model2" = "Model2: Model1 + Biomarker Level",
+               "Model3" = "Model3: Model2 + Time-of-Day Levels Interaction")
+  ) +
+  theme_bw(base_size = 16) +
+  theme(legend.position = c(0.6, 0.25), legend.text = element_text(size = 9)) +
+  xlab("Number of Biomarkers Considered") +
+  ylab("C-Index (Test Subset)") +
+  ggtitle("(b) Mortality Model Performance (Concordance Index)") +
+  scale_x_continuous(breaks = seq(0, 100, 10))
+
+p3=ggplot(SUMMARY,aes(x=topn,y=-log10(pvalue_TODRS))) + 
+  geom_line(size=1.5,color="#377EB8") + 
+  geom_point(size=3,color="#377EB8") + 
+  theme_bw(base_size = 14) + 
+  xlab("Number of Biomarkers Considered") + 
+  ylab("TOD-RS -log10(p.value)") + 
+  ggtitle("(d) TOD-RS Significance") + 
+  scale_x_continuous(breaks = seq(0,100,10))  
+
+p4=ggplot(SUMMARY,aes(x=topn,y=select_n)) + 
+  geom_line(size=1.5,color="#377EB8") + 
+  geom_point(size=3,color="#377EB8") + 
+  theme_bw(base_size = 14) + 
+  xlab("Number of Biomarkers Considered") + 
+  ylab("Number of Biomarkers in TOD-RS") + 
+  ggtitle("(a) Feature Selection (GBM)") + 
+  scale_x_continuous(breaks = seq(0,100,10))
+
+ggpubr::ggarrange(p4,p2,p1,p3,p0,p6,ncol=2,nrow=3)
+dev.off()
+
+#train vs test proformance
+coxfitQ=coxph(Surv(timetoevent,event) ~ risk_scoreQ+risk_score_level, data=plotdf[test_index,-1])
+print(summary(coxfitQ))
+forestPlotGlmBroomUnOrder(coxfitQ,sig_cut = 1)
+
+pdf("figures/mortality_risk_score_delta.pdf",width=8,height=8)
+par(mfrow=c(1,1),lwd=1,cex.main=1.5,cex.axis=1.2,cex.lab=1.2);
+coxfitQ=coxph(Surv(timetoevent,event) ~ pspline(TODRS)+risk_score_level, data=plotdf[test_index,-1])
+termplot(coxfitQ,terms = 1,se = T,main = "All-Cause Mortality Hazard vs TOD-RS",
+         lwd.term = 3,col.term = "#E41A1C",col.se = "#FF7F00",
+         xlab="Time-of-Day Deviation Risk Score (TOD-RS)",ylab="ln(Hazard Ratio) per SD of TOD-RS")
+ abline(h=0,lty=2); abline(v=0,lty=2); 
+ polygon(density(plotdf$TODRS[test_index],na.rm=TRUE),col="#377EB811")
+dev.off()
+
+
+#train vs test proformance
+library(survminer)
+kplot=survfit(Surv(timetoevent,event) ~ risk_scoreQ, data=plotdf[test_index,]) 
+COLORS=c("#4DAF4A", "#377EB8", "#984EA3", "#FF7F00","#E41A1C")
+ggsurv=survminer::ggsurvplot(kplot,data=plotdf[test_index,],fun="event",conf.int=TRUE,
+                            palette = COLORS,
+                            risk.table=TRUE,
+                            censor=FALSE,
+                            show.risk.table="prc", #add risk table
+                            legend.labs = levels(plotdf$risk_scoreQ),
+                            legend.title = "Risk Score Quintile",
+                            xlim=c(0,16),
+                            xlab="Years from Baseline",
+                            ylab="Cumulative Incidence",
+                            title="All-Cause Mortality Based on Biomarker Time-of-Day Deviations")
+
+pdf("figures/mortality_risk_score.pdf",width=8,height=8)
+print(ggsurv)
+dev.off()
+
+#gbmselected %>% left_join(DeathOut, by=c("var" = "biomarker")) %>% arrange(desc(sumDelta))
+plotset=gsub("i$","", gbmselected$var)
+PLOTS=plotBiomarkerSet(head(plotset),healthStratifed= T,diseaseRows = diseaseRows,unadjusted = T)
+ diseaseRows  = getFutureEvents("Death",2);
+ PLOTS=plotBiomarkerSet(head(selected_interaction$biomarker,20),healthStratifed= T,diseaseRows = diseaseRows,unadjusted = T)
+ pdf("figures/all_cause_examples.pdf",width=6,heigh=8)
+ ggpubr::ggarrange(plotlist = PLOTS,ncol=5,nrow=5)
+dev.off()
+
+```
+
+
+# 14. Validation of Oscillatory Effects
+
+Simulations and supporting analyses: null and power simulations, case counts, false discovery rate, heatmaps, spline-shape correlations, and comparison with the serial-sampling study.
+
+## 14.1. Simulation Cosine
+The `simulateOscilation` function generates simulated biomarker data with optional 24-hour cyclic patterns. It takes a biomarker name as input and returns a data frame with the following columns:
+
+- `p.value`: The p-value from fitting a GAM model to the simulated data
+- `A`: The amplitude of the simulated cyclic pattern
+- `B`: The frequency of the simulated cyclic pattern
+- `SD`: The standard deviation of the simulated data
+- `cycling`: A binary indicator of whether the simulated data has a cyclic pattern or not
+- `n`: The degrees of freedom of the fitted GAM model
+- `biomarker`: The input biomarker name
+
+If `showplot` is set to `TRUE`, the function will also plot the observed data and the simulated data with the fitted GAM model.
+
+```{r Simulation Cosine}
+
+simulatedCycle=function(times,A,B=0.8){freq=B*12/pi; Ysim=A*cos(times/freq);} 
+times=seq(0,24,0.1); 
+plot(times,simulatedCycle(times,0.5,0.9))
+
+simulateOscilation = function(biomarker,showplot=FALSE) {
+  hasData = as.vector(!is.na(X[,biomarker]));
+  SD=sd(X[[biomarker]][hasData])
+  times=X[['hourminute']][hasData];
+  CYCLING = rbinom(n=1,1,0.5);
+  rval=rnorm(n=length(times),mean=0,sd=SD)
+  if (CYCLING) {
+    A=runif(1,min=-0.3,max=0.3);
+    B=1.0+runif(1,min=0,max=0.6);
+    Ysim=simulatedCycle(times,A,B)+rval;Ysim = Ysim-mean(Ysim,na.rm=TRUE);
+  } else {
+    A=0; B=0.000001; 
+    Ysim=simulatedCycle(times,A,B)+rval;Ysim = Ysim-mean(Ysim,na.rm=TRUE);
+  } 
+  fit=gam(Ysim ~ s(times, k=24, bs='ps'),gamma=1);
+  tmp=broom::tidy(fit); tmp$A=A; tmp$B=B; tmp$SD=SD; tmp$cycling = CYCLING;  tmp$n=fit$df.null
+  tmp$biomarker=biomarker;
+  
+  if(showplot) { 
+    par(mfrow=c(1,2));
+    Yobs=X[[biomarker]][hasData]
+    fit2=gam(Yobs ~ s(times, k=24,  bs='ps'),gamma=1);
+    plot(fit2);
+    #plot(fit,main=paste(round(A,3), " ", round(B,3)),col=color)
+    plot(times,fit$fitted.values,col="red")
+    points(times,Ysim-rval,col="blue")
+    #plot(times,Yim,im,col=color,cex=0.1)
+    #points(times,fit$fitted.values,col=color)
+  }
+  return(tmp);
+}
+# one simulated fit per biomarker on forked workers (X is shared, not copied)
+ArtfBiomarkers=mclapply(BIOMARKER_NAMES$biomarker, simulateOscilation, mc.cores=6)
+SIM=bind_rows(ArtfBiomarkers)
+
+SIM$cycling = ifelse(SIM$A == 0, "simulated_nocycle", "simulated_cycle")
+SIM$population <- "all"
+SIM$protein = "simulated"
+#ggplot(SIM,aes(p.value,fill=cycling)) + geom_histogram(binwidth=0.01)
+table(SIM$cycling,SIM$p.value<0.0001)
+```
+
+
+## 14.2. Simulation Shuffle
+The `gamwrapShuffled` function is a helper function used in the simulation shuffle analysis.
+ It takes a protein biomarker name as input, 
+ selects the relevant data from the `X` data frame, 
+ shuffles the biomarker values,
+ fits a generalized additive model (GAM) to the shuffled data, 
+ and returns the model summary statistics.
+
+```{r Simulation Shuffle}
+library("broom");
+gamwrapShuffled = function(protein) { 
+  tryCatch(
+    expr={
+       tmpX=X %>% select(hourminute, all_of(COVARIATES), BIOMARKER=all_of(protein)) %>% filter(!is.na(BIOMARKER))
+      tmpX$BIOMARKER=sample(tmpX$BIOMARKER,size = nrow(tmpX))
+      formula_str = paste("BIOMARKER ~ s(hourminute,k=24,bs='ps') +", covariateTerms());
+      fit=gam(as.formula(formula_str), data=tmpX, gamma=1);
+      tmp=broom::tidy(fit); 
+      tmp$protein=protein;
+      tmp$cycling = "shuffled";
+      return(tmp);
+    },
+    error = function(e){ 
+      print(e);
+      return(data.frame());
+    });
+}
+
+
+#parallel
+SIMSHUFFLE=mclapply(BIOMARKER_NAMES$biomarker, gamwrapShuffled,mc.cores=6)
+SIMSHUFFLE=bind_rows(SIMSHUFFLE)
+SIMSHUFFLE$cycling <- "shuffled"
+SIMSHUFFLE$population <- "all"
+```
+
+## 14.3. Simulation Power
+
+Simulates the power to detect oscillatory patterns by subsampling the dataset at different sizes.
+
+```{r Simulation Power}
+TOPCYCLERS=OBSERVED %>% 
+  filter(population=="good_health_all" & cycling =="Observed") %>% 
+  arrange(desc(statistic)) %>% 
+  head(100) %>% 
+  select(biomarker)
+
+gamwrapPower = function(protein) { 
+  POWERSIM=data.frame()
+  tryCatch(
+    expr={
+       tmpX=X %>% select(hourminute, all_of(COVARIATES), BIOMARKER=all_of(protein)) %>% filter(!is.na(BIOMARKER))
+      formula_str = paste("BIOMARKER ~ s(hourminute,k=12,bs='cs') +", covariateTerms());
+      
+      for(n in c(100,500,1000,2000,5000,10000,20000,40000)) { 
+          rset=sample(1:nrow(tmpX),size = n)
+          fit=gam(as.formula(formula_str), data=tmpX, gamma=1,subset = rset);
+          tmp=broom::tidy(fit); 
+          tmp$protein=protein;
+          tmp$nobs=n;
+          POWERSIM=bind_rows(POWERSIM,tmp)
+      }
+    },
+    error = function(e){ 
+      print(e);
+      return(POWERSIM);
+    });
+  return(POWERSIM);
+}
+
+#SIMPOWER=bind_rows(mclapply(TOPCYCLERS$biomarker, gamwrapPower,mc.cores=3))
+SIMPOWER=bind_rows(lapply(TOPCYCLERS$biomarker, gamwrapPower))
+SIMPOWER$cycling <- "power_test"
+SIMPOWER$population <- "all"
+
+p0=SIMPOWER %>% group_by(nobs) %>% summarise(detected=100*sum(p.value < 0.01/3200)/n()) %>%
+  ggplot(aes(nobs,detected)) + geom_point() + geom_line() + theme_bw(base_size = 14) +
+  ggtitle("Detection of Time-of-Day Variation p.value") + 
+  labs(subtitle="Detected if p.value < 0.01/3200 (Bonferroni Correction)") + 
+  ylab("% Osscilators Detected") +
+  geom_hline(yintercept = 80, linetype="dashed", color = "red") +
+  xlab("Number of Cross-sectional Measurments")
+
+p1=SIMPOWER %>% group_by(nobs) %>% summarise(detected=100*sum(statistic>6)/n()) %>%   ggplot(aes(nobs,detected)) + geom_point() + geom_line() + theme_bw(base_size = 14) + 
+  geom_hline(yintercept = 80, linetype="dashed", color = "red") +
+  ggtitle("Detection of Time-of-Day Variation (F-statitic)") +
+  labs(subtitle="Detected if spline F-statistic > 6 (Permutation based 1% FDR threshold)") + 
+  ylab("% Osscilators Detected") + 
+  xlab("Number of Cross-sectional Measurments")
+
+pdf("figures/powersimulation_statistic.pdf",width=6,height=7)
+ggpubr::ggarrange(p0,p1,ncol=1)
+dev.off()
+
+```
+
+## 14.4. Power of testDiffSpline
+
+Power of `testDiffSpline` to detect the spline difference between prior-diabetes cases (E11, E14) and good-health participants without diabetes, from 20 random draws at group sizes of 100 to 20,000 (`figures/power_simulation_heatmap.pdf`).
+
+```{r}
+
+popA  = getPriorDiseaseEvents(c("E11","E14"));
+popB = X$health_rating %in% c("Good","Excellent") & !popA;
+groupSizes =  c(100,500,2000,4000,6000,10000,20000)
+POWERSIM=data.frame();
+for(sim in 1:20) { 
+  print(paste(sim,n));
+  for (n in groupSizes) { 
+  #get random subset from 
+    rsetA= sample (which(popA),size=n);
+    subpopA = rep(FALSE,nrow(X)); subpopA[rsetA]=TRUE;
+    for (k in groupSizes) {
+       rsetB= sample (which(popB),size=k);
+       subpopB = rep(FALSE,nrow(X)); subpopB[rsetB]=TRUE;
+      out=testDiffSpline("glucose",popname=icd10,rowsA=subpopA,rowsB=subpopB,showplot =F ); 
+      POWERSIM=bind_rows(POWERSIM,out)
+    }
+  }
+}
+
+
+POWERSIM$sizeA=cut(POWERSIM$nA, c(0,groupSizes), include.lowest=TRUE,dig.lab=10000); 
+POWERSIM$sizeB=cut(POWERSIM$nB, c(0,groupSizes), include.lowest=TRUE,dig.lab=10000);
+
+alpha = 0.01/3200 # Bonferroni correction for 3200 tests
+POWERSIM$sig=ifelse(POWERSIM$p.value<alpha,1,0)
+
+#POWERSIM$sig=ifelse(POWERSIM$statistic > 6,1,0) #permutation based threshold for 1% FDR
+POWERSIM_SUMMARY = POWERSIM %>% group_by(sizeA,sizeB) %>% 
+  summarise(sig=sum(sig),n=n(),frac_sig=sig/n)
+
+#ggplot heatmap of power simulation
+pdf("figures/power_simulation_heatmap.pdf",width=7,height=6);
+ggplot(POWERSIM_SUMMARY,aes(sizeA,sizeB,fill=frac_sig)) + geom_tile() + scale_fill_gradient(low="white",high="blue") + theme_bw(base_size = 16) + 
+  xlab("Number of Cases (Diabetes)") + 
+  ylab("Number of Controls (Healthy Controls)") + 
+  ggtitle("Power to Detect Difference in Spline Shape") + 
+  #subtitle
+  labs(subtitle="Test: Difference in Glucose Spline Shape \nAlpha = 0.01/3200 (Bonferroni Correction)") +
+  geom_text(aes(label=paste0(round(frac_sig*100),"%")),color="black",size=5) +
+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))  +
+  theme(legend.position = "none")
+dev.off()
+
+
+```
+
+
+## 14.5. Which Diseases Have Enough Cases
+
+Counts the number of individuals with specific ICD10 codes who also have available biomarker data (Proteomics, Lipids, etc.).
+
+```{r disease-case-counts}
+HAVE_PPP=X %>% filter( !is.na(X$IL6) ) %>% select(individual_id) %>% mutate(has_ppp=1)
+HAVE_LIPIDS=X %>% filter(!is.na(X$glucose_lactate)) %>% select(individual_id) %>% mutate(has_lipids=1)
+EVENTS %>% left_join(HAVE_LIPIDS) %>% left_join(HAVE_PPP) %>% group_by(icd10) %>% summarise(n=n(), nppp=sum(has_ppp,na.rm=TRUE), nlipds=sum(has_lipids,na.rm = T)) %>% arrange(n) %>% View()
+```
+
+## 14.6. False Discovery Rate Plots
+
+Plots distributions of p-values and statistics from observed vs. simulated data to visualize FDR control.
+
+```{r plot-fdr-density}
+#SIMSHUFFLE=SIMSHUFFLE %>% rename(biomarker=protein)
+
+#ALL = bind_rows(OBSERVED,SIMSHUFFLE,SIM) 
+#saveRDS(ALL,"outputs/Cycling_protein_PPP_2026.Rds");
+
+ALL=readRDS("outputs/Cycling_protein_PPP_2026.Rds");
+tmp = ALL %>% filter(population %in% c("good_health_all","all"))
+
+FDRLINE=tmp %>% filter(cycling=="shuffled") %>% select(statistic) %>% summarise(fdr01=quantile(statistic,0.99))
+tmp$baralpha=ifelse(tmp$statistic>FDRLINE$fdr01, 1, 0.5)
+tmp$cycling[tmp$cycling == "Observed"] <- "UKBB"
+
+ggplot(tmp,aes(p.value,fill=cycling)) + geom_histogram(binwidth=0.01) + theme_bw(base_size = 16) + scale_fill_brewer(palette = "Set1")
+
+p0=ggplot(tmp %>% filter(cycling %in% c("UKBB","shuffled")),aes(log(statistic),fill=cycling)) + geom_density(binwidth=0.5,alpha=0.5) + theme_bw() +
+  ggtitle("Simulation - Shuffled Blood Draw Time") + geom_vline(xintercept=log(FDRLINE$fdr01)) + xlim(c(-8,8)) + 
+  scale_fill_brewer(palette = "Set1",,name="") + 
+  scale_fill_manual(values=c("#F35000","#377EB8"), name="") +
+  theme(aspect.ratio = .66)
+
+p1=ggplot(tmp %>% filter(cycling %in% c("UKBB","simulated_nocycle", "simulated_cycle")),aes(log(statistic),fill=cycling)) + geom_density(binwidth=0.5,alpha=0.5) + theme_bw() + ggtitle("Simulation - Artificial Oscillators") + geom_vline(xintercept=log(FDRLINE$fdr01)) + xlim(c(-8,8)) + 
+  scale_fill_manual(values=c("#4DAF4A","#E41A1C","#377EB8"), name="") +
+  theme(aspect.ratio = .66)
+
+p2=ggplot(tmp,aes(p.value,fill=cycling)) + geom_histogram(binwidth=0.1,position ="dodge") +  theme_bw() + scale_fill_manual(values=c("#F35000", "#4DAF4A","#E41A1C","#377EB8"), name="") + 
+  ggtitle("Simulations - p-value Distribution") + 
+  theme(aspect.ratio = 0.66)
+
+library(gridExtra)
+pdf("figures/fdr_abc.pdf",width = 6,height = 8)
+grid.arrange(p0,p1,p2)
+dev.off()
+
+
+##summary table
+tmp %>% group_by(subset=population,cycling) %>% 
+  summarise(n=n(),n_detected=sum(statistic > FDRLINE$fdr01)) %>% 
+  arrange(n_detected) 
+
+```
+
+
+## 14.7. Heatmap Plots Top 50
+Generates heatmaps for the top 50 biomarkers by type (Lipids, Proteins, etc.) to visualize diurnal patterns.
+
+```{r plot-heatmaps-top50}
+#CYCLERS=ALL %>% filter(population=="all" & cycling=="Observed" & statistic > FDRLINE$fdr01) 
+#Lipids
+
+for(btype in unique(BIOMARKER_NAMES$type)) {
+  CYCLERS=OBSERVED %>% left_join(BIOMARKER_NAMES) %>%  
+    filter(population=="good_health_all" & type == btype & !grepl("percentage",biomarker)) %>% 
+    arrange(desc(range)) %>% head(50) 
+
+  pdf(sprintf("figures/biomaker_heatmap_%s.pdf",btype),width=12,height=10);
+  tmp=CYCLERS %>% select(biomarker,matches("beta")); rownames(tmp)=tmp$biomarker
+  pheatmap::pheatmap(tmp[,-1] %>% as.matrix(),
+                     cluster_cols = FALSE,
+                     scale = "row",
+                     show_colnames = FALSE,
+                     width=6,height=11, 
+                     border_color=FALSE,)
+  dev.off()
+}
+
+```
+
+## 14.8. Correlations of Spline Shapes
+Analyses the correlation of spline shapes (beta coefficients) between different groups (e.g., Male vs Female, Healthy vs Sick).
+
+```{r compute-spline-correlations}
+CYCLERS=OBSERVED %>% filter(population=="good_health_males")
+tmp1=CYCLERS %>% select(biomarker,matches("beta"));
+CYCLERS=OBSERVED %>% filter(population=="good_health_females")
+tmp2=CYCLERS %>% select(biomarker,matches("beta"));
+CYCLERS=OBSERVED %>% filter(population=="poor_health_males")
+tmp3=CYCLERS %>% select(biomarker,matches("beta"))
+CYCLERS=OBSERVED %>% filter(population=="poor_health_females")
+tmp4=CYCLERS %>% select(biomarker,matches("beta"))
+tmp=tmp1 %>% left_join(tmp2,by="biomarker") 
+rownames(tmp)=tmp$biomarker
+
+COMPARE=matrix(nrow = nrow(tmp1), ncol=4)
+for(i in 1:nrow(tmp1)) { 
+  hmhf=pair_cor(tmp1,tmp2,i); 
+  hmpm=pair_cor(tmp1,tmp3,i); 
+  hfpf=pair_cor(tmp2,tmp3,i); 
+  pmpf=pair_cor(tmp3,tmp4,i); 
+  COMPARE[i,]=c(hmhf,hmpm,hfpf,pmpf);
+}
+colnames(COMPARE)=c("HealthyMalesFemale","HealthPoorMales",
+                    "HealthyPoorFemales","PoorMalesFemales");
+
+COMPARE = as.data.frame(COMPARE)
+COMPARE$biomaker = tmp1$biomarker
+```
+
+## 14.9. Chronobiome Comparison
+
+Compares the results from this UK Biobank analysis with external longitudinal data (Olink Chronobiome).
+
+```{r compare-chronobiome}
+library("ggrepel")
+
+OlinkChronobiome <-read.csv("support_files/Cosinor-lmer_Fit-across-all-samples_Olink_Plasma_Proteomics.txt",sep="\t")
+# Cox association of each biomarker with all-cause mortality (section 13.1), renamed so its
+# statistic and p.value do not clash with the spline fit's
+UNIVARIATE_MORTALITY=readRDS("outputs/Death_coxph.Rds") %>%
+  select(biomarker, mortality_estimate=estimate, mortality_std.error=std.error, mortality_p.value=p.value)
+# testDiffSplineSex fits women as the cases (DiseaseRange) and men as the controls (noDiseaseRange), as in section 8.1
+SEXEFFECTS=readRDS("outputs/saveSexPvaluesGAM.Rds") %>% filter(term == "s(x)") %>% select(biomarker,maleRange=noDiseaseRange,femaleRange=DiseaseRange)
+
+M=ALL %>% filter(cycling == "Observed") %>% filter(grepl("good_health_all",population)) %>%  
+  left_join(OlinkChronobiome, by=c("biomarker" = "Assay")) %>%
+  left_join(UNIVARIATE_MORTALITY, by="biomarker") %>%
+  left_join(SEXEFFECTS) %>% 
+  filter(!is.na(UniProt)) %>%
+  filter(statistic > 0.01 & !is.na(Cosinor_Pvalue))
+
+M=M %>% group_by(biomarker) %>% mutate(maxRange=max(femaleRange,maleRange)) %>% ungroup()
+
+
+FDRLINE$amplitude = quantile(M$Amplitude[M$Cosinor_Qvalue<0.01],0.01)
+
+M=M %>% mutate(FDR_1Prc_Threshold=case_when(
+     Cosinor_Qvalue <= 0.01 & statistic >= FDRLINE$fdr01  ~ "Both",
+     Cosinor_Qvalue > 0.01 & statistic < FDRLINE$fdr01 ~   "Neither",
+     Cosinor_Qvalue > 0.01  & statistic >= FDRLINE$fdr01  ~  "Only UKBB",
+     Cosinor_Qvalue <= 0.01 & statistic < FDRLINE$fdr01 ~   "Only Chronobiome",
+     TRUE ~ "Neither"))
+
+#Q.value
+M = M %>% mutate(UKBB_Qvalue = p.adjust(p.value, method = "fdr"))
+   
+
+pdf("figures/ukbb_vs_chronobiome_all.pdf",width=8,height=4);
+p0=ggplot(M,aes(log(statistic),Amplitude,color=FDR_1Prc_Threshold,label=biomarker,label=biomaker))+
+  geom_point(alpha=0.8) +
+  xlab("log(statistic)") + 
+  ylab("Amplitude - Longitudenal Full Cycle")+
+  geom_vline(xintercept=log(FDRLINE$fdr01)) +
+  geom_hline(yintercept=FDRLINE$amplitude) +
+  theme_bw(base_size = 16) +
+  theme(legend.position = c(0.25, 0.95), # Adjust coordinates as needed
+        legend.justification = c("right", "top"),
+        legend.title = element_text(size = 10),
+        legend.text = element_text(size = 10)) +
+  scale_color_manual(values=c("#4DAF4A","#377EB8","#E41A1C","#E45C1C"), name="")
+ # facet_wrap(~population)
+print(p0)
+dev.off()
+
+
+#summary
+UKBBTOPCYCLERS=M %>% select(population,biomarker, statistic, p.value, UKBB_Qvalue, maleRange, femaleRange, Cosinor_Pvalue, Cosinor_Qvalue, Amplitude,FDR_1Prc_Threshold) %>%  arrange(desc(statistic)) %>%  filter(Amplitude>1) 
+write.table(UKBBTOPCYCLERS,"outputs/Chronobiome_UKBB_TopCyclers.tsv",sep="\t",row.names = F)
+
+tmp=M %>% group_by(population,FDR_1Prc_Threshold) %>% tally()
+```
+
+
+# 15. Chronotype Effects on Diurnal Patterns
+
+This section asks whether chronotype (field 1180) changes diurnal patterns. The first chunk recodes chronotype as an ordered morning-to-evening exposure; participants who answered "Do not know" or did not answer are excluded.
+
+```{r}
+SLEEP = readRDS("./preprocessed/UKBB_SLEEP.Rds")
+SLEEP = SLEEP %>% filter(instance_id == params$instance)
+# chronotype as the exposure: ordered factor with non-answers set to NA so they are excluded.
+# Deliberately differs from the covariate coding in section 1.1 (which keeps do_not_know / unknown):
+# testChronotypeSpline uses as.numeric(chronotype) as a 1-4 morning-to-evening gradient.
+SLEEP <- SLEEP %>% mutate(
+  chronotype = factor(
+    case_when(
+      chronotype == "Definitely a 'morning' person"          ~ "morning",
+      chronotype == "More a 'morning' than 'evening' person" ~ "more_morning",
+      chronotype == "More an 'evening' than a 'morning' person" ~ "more_evening",
+      chronotype == "Definitely an 'evening' person"         ~ "evening",
+      TRUE ~ NA_character_
+    ),
+    levels = c("morning", "more_morning", "more_evening", "evening"),
+    ordered = TRUE
+  )
+)
+table(SLEEP$chronotype, useNA = "always")
+```
+
+## 15.1. Fit Chronotype Spline Interaction
+
+Tests, for each biomarker, whether the diurnal spline changes along the morning-to-evening gradient (`testChronotypeSpline`); saves `outputs/saveChronotypeFits.Rds`.
+
+```{r chronotype-spline-fit}
+registerDoParallel(cores = 6)
+CHRONOTYPE_FITS <- foreach(bm = BIOMARKER_NAMES$biomarker, .combine = rbind) %dopar% {
+  library(mgcv)
+  library(broom)
+  library(dplyr)
+  testChronotypeSpline(bm)
+}
+saveRDS(CHRONOTYPE_FITS, "outputs/saveChronotypeFits.Rds")
+```
+
+## 15.2. Plot Chronotype Results
+
+Applies FDR correction to the chronotype interaction term, then plots its strength for every biomarker (`figures/chronotype_spline_effects.pdf`) and the splines of the 16 most significant biomarkers (`figures/chronotype_spline_examples.pdf`).
+
+```{r chronotype-plot}
+CHRONOTYPE_FITS <- readRDS("outputs/saveChronotypeFits.Rds")
+
+# Keep only the chronotype interaction smooth term and apply FDR correction
+chrono_results <- CHRONOTYPE_FITS %>%
+  filter(term == "s(hourminute):chronotype_num") %>%
+  mutate(adj.p.value = p.adjust(p.value, "fdr"),
+         sig = ifelse(adj.p.value < 0.01, "Sig", "Not Sig")) %>%
+  left_join(BIOMARKER_NAMES, by = "biomarker") %>%
+  arrange(adj.p.value)
+
+chrono_results$plotLabel <- ifelse(chrono_results$statistic > 10 & chrono_results$adj.p.value < 0.01,
+                                   chrono_results$biomarker, "")
+
+mycolors <- c("black", "#E41A1C")
+
+pdf("figures/chronotype_spline_effects.pdf", width = 8, height = 8)
+ggplot(chrono_results, aes(statistic, -log10(adj.p.value), label = plotLabel, color = sig)) +
+  geom_point(alpha = 0.7) +
+  theme_bw(base_size = 16) +
+  ggrepel::geom_label_repel(size = 3, max.overlaps = 20) +
+  scale_color_manual(values = mycolors) +
+  geom_hline(yintercept = -log10(0.01), linetype = "dashed") +
+  xlab("Spline Interaction Statistic") +
+  ylab("-log10(FDR)") +
+  ggtitle("Chronotype Modification of Diurnal Spline Shape") +
+  facet_wrap(~type) +
+  theme(legend.position = "inside", legend.position.inside = c(0.1, 0.9))
+dev.off()
+
+# Example spline plots for top hits
+top_hits <- chrono_results %>% filter(adj.p.value < 0.01) %>% head(16) %>% pull(biomarker)
+PLOTS <- lapply(top_hits, plotChronotypeSpline)
+names(PLOTS) <- top_hits
+pdf("figures/chronotype_spline_examples.pdf", width = 10, height = 10)
+ggpubr::ggarrange(plotlist = PLOTS, ncol = 4, nrow = 4)
+dev.off()
+```
+
+## 15.3. Spline Shape per Chronotype
+
+Fits a separate sex-adjusted diurnal GAM for each of the four chronotype groups across all biomarkers, collecting spline betas and amplitude (range). Output mirrors the OBSERVED object structure for downstream comparisons.
+
+```{r chronotype-spline-shapes}
+registerDoParallel(cores = 6)
+CHRONOTYPE_SHAPES <- foreach(bm = BIOMARKER_NAMES$biomarker, .combine = rbind) %dopar% {
+  library(mgcv)
+  library(broom)
+  library(dplyr)
+  gamwrapChronotype(bm)
+}
+saveRDS(CHRONOTYPE_SHAPES, "outputs/saveChronotypeShapes.Rds")
+```
+
+## 15.4. Pairs Plot of Oscillatory Ranges by Chronotype
+
+Pairs plot of each biomarker's daytime range in the four chronotype groups (`figures/chronotype_pairs_range.pdf`).
+
+```{r chronotype-pairs-plot}
+CHRONOTYPE_SHAPES <- readRDS("outputs/saveChronotypeShapes.Rds")
+
+tmp <- CHRONOTYPE_SHAPES %>%
+  filter(term == "s(hourminute)") %>%
+  reshape2::dcast(biomarker ~ population, value.var = "range") %>%
+  select(biomarker, morning, more_morning, more_evening, evening)
+
+pdf("figures/chronotype_pairs_range.pdf", width = 10, height = 10)
+par(cex.main = 1.5)
+pairs(tmp[, -1],
+  lower.panel = panel.lm, upper.panel = panel.cor, lwd = 1.5, pch = 19,
+  col = adjustcolor("black", alpha.f = 0.3),
+  labels = c("Morning", "More\nMorning", "More\nEvening", "Evening"),
+  main = "Oscillatory Ranges by Chronotype"
+)
+dev.off()
+```
+
+## 15.5. Menopause Effect in Women
+
+Tests whether diurnal splines differ between pre- and post-menopause women in good health (`testDiffSplineWomen`), using age at menopause (field 3581); saves `outputs/saveWomenManaposeEffect.Rds`.
+
+```{r women-chronotype-interaction}
+age_at_menopause = readRDS("preprocessed/age_at_menopause.Rds")
+
+# one row per woman: the file has a row for each visit at which she reported it, and joining
+# those would duplicate her rows in X. Keep the report from her earliest visit; comparing it
+# with her age at this visit gives her status at this visit.
+age_at_menopause = age_at_menopause %>%
+  arrange(individual_id, instance_id) %>%
+  distinct(individual_id, .keep_all = TRUE) %>%
+  select(individual_id, menopause_instance = instance_id, age_at_menopause)
+
+nrowX = nrow(X)
+X = X %>% select(-any_of(c("age_at_menopause", "menopause_instance", "post_menopause"))) # drop columns from an earlier run of this chunk
+X = X %>% left_join(age_at_menopause, by = "individual_id");
+stopifnot(nrow(X) == nrowX) # the join must not add rows
+# menopause at her current age counts only if she reported it at this visit or an earlier one
+# (the question is asked only after menopause); a later report could mean it came after this visit
+X = X %>% mutate(post_menopause = ifelse(!is.na(age_at_menopause) &
+  (age_at_menopause < age | (age_at_menopause == age & menopause_instance <= instance_id)), 1, 0))
+
+FITS=data.frame();
+for(bm in BIOMARKER_NAMES$biomarker) { 
+  print(bm)
+  out=testDiffSplineWomen(bm)
+  out$biomarker=bm;
+  FITS=bind_rows(FITS,out)
+}
+saveRDS(FITS,"outputs/saveWomenManaposeEffect.Rds")
+```
+
+
+# 16. Participant Characteristics and Cosinor Fits
+
+Supplementary analyses: how participants are distributed over draw time, sleep and fasting, and a cosinor model as an alternative to the GAM fits.
+
+## 16.1. Participant Distributions
+
+Distributions of draw time by health rating and by chronotype, and of sleep and fasting duration by sex (`figures/participant_distributions.pdf`).
+
+```{r uniformaty test}
+visithistogram=X %>%
+    #visit = round hourminute into 10min intervals
+    group_by(visit = round(hourminute, 1)) %>%
+    summarise(count=n())
+
+groupcounts=X %>%
+    #visit = round hourminute into 10min intervals
+    group_by(health_rating) %>%
+    summarise(group_count=n())
+
+
+tmp1=X %>% filter(!is.na(health_rating)) %>%
+    group_by(health_rating, visit = round(hourminute, 1)) %>%
+    tally() %>%
+    left_join(visithistogram) %>%
+    left_join(groupcounts) %>%
+    mutate(n = n/count)
+    #filter(visit >= 900 & visit <= 1900) %>%
+    #filter(count > 2000) %>%
+
+chronotype_counts <- X %>%
+    filter(!is.na(chronotype) & !chronotype %in% c("do_not_know", "unknown")) %>%
+    group_by(chronotype) %>%
+    summarise(group_count = n())
+
+tmp2 <- X %>%
+    filter(!is.na(chronotype) & !chronotype %in% c("do_not_know", "unknown")) %>%
+    group_by(chronotype, visit = round(hourminute, 1)) %>%
+    tally() %>%
+    left_join(visithistogram) %>%
+    left_join(chronotype_counts) %>%
+    mutate(n = n / count)
+
+sleep_duration_hist  <- as.data.frame(table(round(X$sleepduration), X$sex))
+fasting_duration_hist <- as.data.frame(table(round(X$fastingtime), X$sex)) %>%
+    filter(as.numeric(as.character(Var1)) <= 24)
+
+p_health <- ggplot(tmp1, aes(visit, n, fill = health_rating)) +
+    geom_bar(stat = "identity") +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+    theme_bw(base_size = 14) +
+    labs(x = "Hour", y = "% Participants", fill = "Health Rating")
+
+p_chronotype <- ggplot(tmp2, aes(visit, n, fill = chronotype)) +
+    geom_bar(stat = "identity") +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+    scale_fill_brewer(palette = "Set3", direction = -1,
+                      labels = c("Morning", "More morning", "More evening", "Evening")) +
+    theme_bw(base_size = 14) +
+    labs(x = "Hour", y = "% Participants", fill = "Chronotype")
+
+p_sleep <- ggplot(sleep_duration_hist, aes(x = as.numeric(as.character(Var1)), y = Freq, fill = Var2)) +
+    geom_col(position = "dodge", colour = "white") +
+    scale_fill_brewer(palette = "Set1", name = "Sex") +
+    theme_bw(base_size = 14) +
+    labs(x = "Sleep Duration (hours)", y = "Count")
+
+p_fasting <- ggplot(fasting_duration_hist, aes(x = as.numeric(as.character(Var1)), y = Freq, fill = Var2)) +
+    geom_col(position = "dodge", colour = "white") +
+    scale_fill_brewer(palette = "Set1", name = "Sex") +
+    theme_bw(base_size = 14) +
+    labs(x = "Fasting Time (hours)", y = "Count")
+
+pdf("figures/participant_distributions.pdf", width = 14, height = 8)
+ggpubr::ggarrange(p_health, p_chronotype, p_sleep, p_fasting,
+                  ncol = 2, nrow = 2, labels = "AUTO")
+dev.off()
+```
+
+## 16.2. Cosinor Biomarker Fits
+
+Fits a 24-hour cosinor model (cosine and sine terms plus the standard covariates) to each biomarker in good-health participants; saves `outputs/cosinor_fits.Rds`.
+
+```{r cosinor-fit}
+fitCosinor <- function(biomarker, rowsubset = rep(TRUE, nrow(X)), adjust_sex = TRUE) {
+  # only the columns the model uses; X[rowsubset, ] would copy all ~3,300 columns
+  df <- X[rowsubset & !is.na(X[[biomarker]]), c(biomarker, "hourminute", COVARIATES)]
+  if (nrow(df) < 100) return(NULL)
+
+  df$cos24 <- cos(2 * pi * df$hourminute / 24)
+  df$sin24 <- sin(2 * pi * df$hourminute / 24)
+
+  formula_str <- sprintf("`%s` ~ cos24 + sin24 + %s",
+    biomarker, covariateTerms(drop = if (!adjust_sex) "sex"))
+
+  fit <- tryCatch(lm(as.formula(formula_str), data = df), error = function(e) NULL)
+  if (is.null(fit)) return(NULL)
+
+  beta  <- coef(fit)["cos24"]
+  gamma <- coef(fit)["sin24"]
+  amp   <- sqrt(beta^2 + gamma^2)
+  acro  <- (atan2(gamma, beta) * 24 / (2 * pi)) %% 24
+
+  fit0  <- lm(as.formula(sub("cos24 \\+ sin24 \\+ ", "", formula_str)), data = df)
+  ftest <- anova(fit0, fit)
+
+  data.frame(
+    biomarker  = biomarker,
+    mesor      = coef(fit)[["(Intercept)"]],
+    amplitude  = amp,
+    acrophase  = acro,
+    p_rhythm   = ftest$`Pr(>F)`[2]
+  )
+}
+
+goodHealthSubset=X$health_rating  %in% c("Excellent", "Good")
+# one cosinor fit per biomarker on forked workers (X is shared, not copied)
+COSINOR = bind_rows(mclapply(BIOMARKER_NAMES$biomarker, fitCosinor,
+                             rowsubset = goodHealthSubset, mc.cores = 6))
+saveRDS(COSINOR, "outputs/cosinor_fits.Rds")
+```
+
+## 16.3. Compare Cosinor vs GAM
+
+Compares each biomarker's cosinor amplitude with its GAM daytime range in the good-health, sex-adjusted group (`figures/cosinor_vs_gam.pdf`).
+
+```{r cosinor-vs-gam}
+COSINOR <- readRDS("outputs/cosinor_fits.Rds")
+
+# Load GAM results for good-health all-sex stratum
+gam_ref <- OBSERVED %>%
+  filter(population == "good_health_all") %>%
+  select(biomarker, gam_range = range, 
+         gam_statistic = statistic, gam_pvalue = p.value) 
+
+cmp <- COSINOR %>%
+  left_join(gam_ref, by = "biomarker") %>%
+  filter(!is.na(gam_range))
+
+cor.test(cmp$amplitude, cmp$gam_range, use = "complete.obs")
+
+
+#compare sig overlap
+ct <- table(cmp$p_rhythm < 0.05/3226, cmp$gam_pvalue < 0.05/3226)
+print(ct)
+fisher.test(ct)
+
+p_amp <- ggplot(cmp, aes(y = amplitude, x = gam_range,)) +
+  geom_point(alpha = 0.5, size = 1) +
+  geom_smooth(method = "lm", se = FALSE, colour = "black", linewidth = 0.8) +
+  scale_colour_manual(values = c("grey70", "#E41A1C"), name = "FDR < 1%") +
+  theme_bw(base_size = 16) +
+  geom_abline(slope = 0.5, intercept = 0, linetype = "dashed", color = "grey40") +
+  labs(y = "Cosinor Daytime Amplitude", x = "GAM Daytime Amplitude",
+       title = "Amplitude Estimation: Cosinor vs GAM")
+
+pdf("figures/cosinor_vs_gam.pdf", width = 6, height = 6)
+print(p_amp)
+dev.off()
+
+cat("Correlation (amplitude vs GAM range):",
+    round(cor(cmp$amplitude, cmp$gam_range, use = "complete.obs"), 3), "\n")
+
+DEV <- cmp %>%
+  filter(gam_statistic > 6) %>%
+  fit_deviation("gam_range", "amplitude", reference = "identity")
+
+deviation_summary <- DEV %>%
+  summarise(
+    n              = n(),
+    slope          = first(slope),
+    median_rel_dev = median(rel_dev),
+    pct_beyond_10  = 100 * mean(rel_dev >  0.10),
+    .groups = "drop"
+  )
+print(deviation_summary)
+```

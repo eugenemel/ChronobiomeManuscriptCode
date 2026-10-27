@@ -1,0 +1,223 @@
+# Compare Chronobiome Serial Sampling Data to UKBB Olink Proteomics Data
+
+Loads the serial-sampling Olink study and the baseline UKBB fits, and defines `getGamFitSerial()`, which fits a diurnal GAM to the serial data adjusted for age group and sex, with a random intercept for each subject.
+
+```{r}
+library(reshape2)
+library(dplyr)
+library(mgcv)
+library(ggplot2)
+
+# UKBB side, from ChronobiomeUKBB.Rmd: fitting functions, baseline model dataframe (section 4.1)
+# and spline fits (section 7). X is loaded only if this session does not already have it.
+source("ChronoFunctions.R")
+if (!exists("X")) load("outputs/savedX.Rdata") # X and BIOMARKER_NAMES
+OBSERVED <- readRDS("outputs/saveOBSERVED.Rds")
+
+# Read subject data from 2025-09-17_Common-chronobiome-and-ukbb-cyclers_Sample-metadata_AB-proteomics_Plasma_NPX-values.txt
+SAMPLE_INFO <- read.table("support_files/2025-09-17_Common-chronobiome-and-ukbb-cyclers_Sample-metadata_AB-proteomics_Plasma_NPX-values.txt", header = TRUE, sep = "\t", stringsAsFactors = FALSE)
+# Read biomarker data from 2025-09-17_Common-chronobiome-and-ukbb-cyclers_Feature-matrix_AB-proteomics_Plasma_NPX-values.txt
+SAMPLE_DATA <- read.table("support_files/2025-09-17_All-protein-assays_Feature-matrix_AB-proteomics_Plasma_NPX-values.txt", header = TRUE, sep = "\t", stringsAsFactors = FALSE)
+# Reshape data to long format for time-series analysis
+SERIAL <- melt(SAMPLE_DATA, id.vars = c("Feature_id", "Symbol"), variable.name = "Sample_id", value.name = "value") %>% 
+  left_join(SAMPLE_INFO, by = "Sample_id")
+```
+
+```{r}
+# Function to fit Generalized Additive Model (GAM) to serial sampling data
+# Adjusts for Age, Sex, and includes Subject_id as a random effect
+getGamFitSerial <- function(biomarker, plotdata = FALSE, adjustforSex = TRUE) {
+
+  tmpdf <- SERIAL %>%
+    filter(Symbol == biomarker) %>%
+    filter(!is.na(value)) %>%
+    filter(!is.na(Sex)) %>%
+    mutate(Subject_id = factor(Subject_id)) # bs = "re" needs a factor
+
+  # tryCatch fit gam as function of Clock_time subject level as random effect Subject_id
+  gamfit <- NULL
+
+  tryCatch({
+    # Model: Outcome ~ Smooth(Time) + Fixed(Age, Sex) + Random(Subject)
+    # Age group and sex are constant within a subject, so they are only estimable with subject as a
+    # random intercept. REML is the usual choice with random effects, and matches bam's fREML in getGamFit.
+    gamfit <- mgcv::gam(value ~ s(Clock_time, k = 6) + Age_group + Sex + s(Subject_id, bs = "re"),
+                        data = tmpdf, method = "REML")
+  }, error = function(e) {
+    print(paste("Error in gam fit for", biomarker, ":", e$message))
+    return(NULL)
+  })
+  
+  if (plotdata) {
+    pout <- ggplot(tmpdf, aes(Clock_time, value)) + 
+      geom_point() + 
+      geom_smooth(method = "gam", formula = y ~ s(x, k = 6)) + 
+      theme_bw(base_size = 16) + 
+      ggtitle(biomarker) + xlab("Time of day (hours)") + ylab("NPX") + 
+      theme(plot.title = element_text(hjust = 0.5))
+    
+    print(pout)
+  }
+  return(gamfit)
+}   
+fit <- getGamFitSerial("SNCA", plotdata = TRUE)
+as.vector(fit$coefficients[grepl("Clock_time", names(fit$coefficients))])
+
+# fit gam models to SAMPLE_DATA
+```
+
+# Plotting functions comparison to UKBB
+
+Functions that overlay the serial and UKBB diurnal curves of a protein (`compareFits`, `compareBiomarkerSet`) and correlate the two curves (`correlationSerialUKBB`); the UKBB curve comes from good-health participants, adjusted for sex. The last chunk computes the correlation for every protein in the serial data.
+
+```{r}
+greatHealth <- X$health_rating == "Excellent" | X$health_rating == "Good"
+
+# Compare the fitted curve from local Serial data with UKBB reference data
+compareFits <- function(biomarker) { 
+    fitSerial <- getGamFitSerial(biomarker, plotdata = FALSE)
+    if (is.null(fitSerial)) { return(NA) }
+    
+    pdf(NULL)
+    plotdata <- mgcv::plot.gam(fitSerial, select = 1)[[1]] # the Clock_time smooth, not the subject random effect
+    plotdf <- data.frame(x = plotdata$x, fit = plotdata$fit, se = plotdata$se, dataset = "Serial")
+    plotdf$x <- plotdf$x / 100 # convert to hours
+    dev.off()
+
+    tmpdf <- getGamFit(biomarker, adjustforSex = TRUE, rowsubset = greatHealth, plotdata = TRUE)
+    tmpdf$dataset <- "UKBB"
+
+  mycolors <- c("#E41A1C", "#377EB8")
+  p0 <- ggplot(rbind(plotdf, tmpdf), aes(x, fit, color = dataset)) + 
+    geom_line(size = 1) + 
+    geom_ribbon(aes(ymin = fit - se, ymax = fit + se, fill = dataset), alpha = 0.2, color = NA) + # se from plot.gam is already 2 standard errors
+    theme_bw(base_size = 16) + 
+    ggtitle(biomarker) + xlab("Time of day (hours)") + ylab("NPX") + 
+    scale_fill_manual(values = rev(mycolors)) +
+    scale_color_manual(values = rev(mycolors)) +
+    theme(plot.title = element_text(hjust = 0.5))
+  return(p0)
+}
+
+
+correlationSerialUKBB <- function(biomarker) { 
+    if (!biomarker %in% BIOMARKER_NAMES$biomarker) { return(data.frame()) }
+  
+    fitSerial <- getGamFitSerial(biomarker, plotdata = FALSE)
+    if (is.null(fitSerial)) { return(data.frame()) }
+    
+    
+    tmpdf <- getGamFit(biomarker, adjustforSex = TRUE, rowsubset = greatHealth, plotdata = TRUE)
+    
+    pdf(NULL)
+    plotdata <- mgcv::plot.gam(fitSerial, select = 1, xlim = range(tmpdf$x * 100))[[1]]
+    plotdf <- data.frame(x = plotdata$x, fit = plotdata$fit, se = plotdata$se, dataset = "Serial")
+    plotdf$x <- plotdf$x / 100 # convert to hours
+    dev.off()
+    
+    # significance of correlation between the two fitted curves
+    cor.test.out <- cor.test(plotdf$fit, tmpdf$fit)
+    tmp <- broom::tidy(cor.test.out)
+    tmp$biomarker <- biomarker
+    return(tmp)
+}
+
+compareBiomarkerSet <- function(biomarkers) { 
+  
+  MINIMAL_THEME<- theme_minimal() +
+    theme(
+    legend.position = "none",
+    plot.title = element_text(size = 20, hjust = 0.5),
+    axis.title.x = element_blank(),
+    axis.text = element_text(size = 14),
+    axis.title.y = element_blank(),
+    panel.grid.major.x = element_line(color = "grey85", linewidth =1),
+    panel.grid.major.y = element_line(color = "grey85", linewidth =0.5),
+    panel.grid.minor = element_blank(),    # Remove intermediate grid lines
+    #panel.border = element_rect(color = "black", fill = NA, linewidth = 1)
+  ) 
+
+  PLOTS <- list()
+  for (bm in biomarkers) {
+    p0 <- compareFits(bm)
+    p0 <- p0 + MINIMAL_THEME + scale_x_continuous(limits = c(0, 20), breaks = c(0,4,8,12,16,18,20)) + 
+      scale_y_continuous(
+      expand = expansion(mult = c(0.1, 0.2)),
+      breaks = function(lims) sort(unique(c(pretty(lims), lims[2]))),
+      labels = scales::label_number(accuracy = 0.1, drop0trailing = TRUE) #
+    )
+    PLOTS[[bm]] <- p0
+  }
+  return(PLOTS)
+}
+```
+
+```{r}
+# compute correlations for all symbols present in the serial data
+CORRELATIONS <- bind_rows(lapply(unique(SERIAL$Symbol), correlationSerialUKBB))
+```
+
+# Plot Diurnal Pattern Correlation (UKBB and Chronobiome) by different cutoffs
+
+Plots the mean serial-UKBB curve correlation as the UKBB oscillation threshold rises (`figures/ChronobiomeSerialCorrelationByCutoff.pdf`), and overlays the curves of strong and weak UKBB oscillators (`figures/ChronobiomeSerialHigh.pdf`, `figures/ChronobiomeSerialLow.pdf`).
+
+```{r}
+# Load external Chronobiome/UKBB cosinor fit results for comparison
+OlinkChronobiome <- read.csv("support_files/Cosinor-lmer_Fit-across-all-samples_Olink_Plasma_Proteomics.txt", sep = "\t")
+
+tmp <- OBSERVED %>% 
+  left_join(BIOMARKER_NAMES) %>%  
+  filter(population == "good_health_all" & type == "Protein") %>%
+  left_join(OlinkChronobiome, by = c("biomarker" = "Assay")) %>%
+  left_join(CORRELATIONS, by = "biomarker")
+
+# Analyze how correlation between datasets changes as we filter for stronger cyclic signals in UKBB
+CORRELATION_SUMMARY <- data.frame()
+
+for (cutoff in seq(0, 6, by = 0.1)) { 
+  z <- tmp %>% filter(log(statistic.x) > cutoff & !is.na(estimate))
+  
+  CORRELATION_SUMMARY <- rbind(CORRELATION_SUMMARY, 
+                            data.frame(cutoff = cutoff, 
+                                       mean = mean(z$estimate), 
+                                       sd = sd(z$estimate), 
+                                       n = nrow(z)))
+}
+
+pdf("figures/ChronobiomeSerialCorrelationByCutoff.pdf", width = 8, height = 6)
+ggplot(CORRELATION_SUMMARY, aes(cutoff, mean)) + geom_line() + geom_point() + 
+  theme_bw(base_size = 16) + 
+  geom_ribbon(aes(ymin = mean - 2 * sd/sqrt(n), ymax = mean + 2 * sd/sqrt(n)), alpha = 0.2, fill = "lightblue") +
+  xlab("UKBB log(statistic) Threshold") + 
+  ylab("Average Correlation") +
+  ggtitle("Correlation of Diurnal Patterns (UKBB vs Chronobiome)") +
+  theme(plot.title = element_text(hjust = 0.5))
+dev.off()
+
+```
+
+```{r}
+btype <- "Protein"
+# Select top low-confidence and high-confidence cyclers based on p-value and statistic thresholds
+CYCLERSLOW <- OBSERVED %>% left_join(BIOMARKER_NAMES) %>%  
+    filter(population == "good_health_all" & type == btype & !grepl("percentage", biomarker)) %>% 
+    filter(p.value > 0.01 & statistic < 6) %>% 
+    arrange(range) %>%  head(51) 
+
+CYCLERSHIGH <- OBSERVED %>% left_join(BIOMARKER_NAMES) %>%  
+    filter(population == "good_health_all" & type == btype & !grepl("percentage", biomarker)) %>% 
+    filter(p.value < 0.01 & statistic > 6) %>% 
+    arrange(desc(range)) %>%  head(50) 
+
+
+PLOTSLOW <- compareBiomarkerSet(head(CYCLERSLOW$biomarker,40))
+pdf("figures/ChronobiomeSerialLow.pdf", width = 11.5, height = 16)
+ggpubr::ggarrange(plotlist = PLOTSLOW, ncol = 4, nrow = 10 )
+dev.off()
+
+PLOTSHIGH <- compareBiomarkerSet(head(CYCLERSHIGH$biomarker,40))
+pdf("figures/ChronobiomeSerialHigh.pdf", width = 11.5, height = 16)
+ggpubr::ggarrange(plotlist = PLOTSHIGH, ncol = 4, nrow = 10)
+dev.off()
+```
+

@@ -1,0 +1,630 @@
+---
+title: "Download and Preprocess UK Biobank Data"
+output: html_notebook
+---
+
+```{r}
+# Load required libraries for UK Biobank data access and data manipulation
+library(ukbb)
+library(dplyr)
+
+# output folder for the preprocessed files (no-op if it, or a symlink to it, already exists)
+dir.create("preprocessed", showWarnings = FALSE)
+```
+
+
+```{r}
+# Setup connection to UK Biobank cloud resources
+# Establishes authentication and retrieves configuration paths for data access
+### Setup UKBB connection
+# Define project and authenticate
+project <- "ukbb_v5"
+setup_ukbb(project = "ukbb_v5", auth_file = "~/.ukbb_v5_auth.json")
+
+# Retrieve configuration paths
+pheno_base <- get_ukbb_config("phenotypes", project = project)
+bulk_bucket <- get_ukbb_config("bulk.metadata", project = project)
+bucket <- get_ukbb_config("bucket", project = project, include_bucket = FALSE)
+```
+
+# Get Basic Covariate Structure (Baseline only) 
+```{r}
+# Extract baseline covariates from UK Biobank
+# Retrieves demographic and lifestyle variables including age, sex, smoking status,
+# alcohol intake, BMI, and town deprivation index
+# Performs multiple imputation using mice package to handle missing values
+### Get fields for covariates
+age <- get_field(fld_id = 21003) %>% select(individual_id, instance_id, age = value)
+sex <- get_field(fld_id = 31) %>% select(individual_id, sex = value)
+town_deprev <- get_field(fld_id = 189) %>% select(individual_id, town_depr = value)
+
+smoking <- get_field(fld_id = 1239) %>% select(individual_id, instance_id, smoking = value)
+levels(smoking$smoking) <- list("No" = 0, "Only occasionally" = 1, "Yes, on most or all days" = 2, "Prefer not to answer" = 4)
+
+pack_years_smoking <- get_field(fld_id = 20161) %>% select(individual_id, instance_id, pack_years_smoking = value)
+
+visit_date <- get_field(fld_id = 53) %>% select(individual_id, instance_id, visit_date = value)
+
+# Map to approximate drinking per month
+alcohol_intake <- get_field(fld_id = 1558) %>% select(individual_id, instance_id, alcohol_intake = value)
+levels(alcohol_intake$alcohol_intake) <- c(-1, 30, 16, 4, 3, 0.5, 0)
+alcohol_intake$alcohol_intake <- as.double(paste(alcohol_intake$alcohol_intake))
+
+bmi <- get_field(fld_id = 21001) %>% select(individual_id, instance_id, bmi = value)
+health_rating <- get_field(fld_id = 2178) %>% select(individual_id, instance_id, health_rating = value)
+health_rating[health_rating < 0] <- NA
+first_visit_date <- get_field(fld_id = 53) %>% 
+  filter(instance_id == 0) %>% 
+  select(individual_id, first_visit_date = value)
+
+# Combine covariates
+UKBB <- age
+UKBB <- UKBB %>% 
+  left_join(sex) %>% 
+  left_join(town_deprev) %>%
+  left_join(smoking) %>% 
+  left_join(pack_years_smoking) %>% 
+  left_join(alcohol_intake) %>% 
+  left_join(bmi) %>% 
+  left_join(visit_date) %>% 
+  left_join(first_visit_date) 
+
+UKBB$smoking <- as.numeric(UKBB$smoking)
+
+# Impute missing values using mice
+miceout <- mice::mice(UKBB, method = "rf", m = 1)
+UKBBimp <- complete(miceout)
+
+# Save processed covariates
+saveRDS(UKBBimp %>% as_tibble(), "preprocessed/UKBB_BaselineCovariates.Rds")
+saveRDS(health_rating, "preprocessed/UKBB_HealthRating.Rds")
+```
+
+#Cancers
+```{r}
+# Extract cancer diagnosis data and death records
+# Retrieves cancer dates, ICD-10 codes, and initial death records from UK Biobank
+cancer_date <- get_field(40005)
+cancer_type <- get_field(40006)
+                                                                                                
+CANCER <- cancer_date %>% 
+  left_join(cancer_type, by = c("individual_id", "instance_id", "array_id")) %>% 
+  select(individual_id, date = value.x, icd10 = value.y)
+CANCER$date <- as.Date(CANCER$date)
+saveRDS(CANCER, "preprocessed/UKBB_Cancer.Rds")
+
+DEATH <- get_field(40000)
+DEATH$icd10 <- "Death"
+DEATH <- DEATH %>% select(individual_id, date = value, icd10)
+DEATH$date <- as.Date(DEATH$date)    
+saveRDS(DEATH, "preprocessed/UKBB_Death.Rds")
+```
+
+```{r}
+# Extract detailed death cause information
+# Retrieves primary and secondary causes of death with ICD-10 codes
+# Truncates ICD-10 codes to 3 characters for grouping
+death_date <- get_field(40000) %>% select(individual_id, instance_id, date = value)
+death_age <- get_field(40007) %>% select(individual_id, instance_id, age_at_death = value)
+death_cause_primary <- get_field(40001) %>% select(individual_id, instance_id, icd10 = value)
+death_cause_primary$icd10_short <- strtrim(death_cause_primary$icd10, 3)
+
+saveRDS(death_date %>% left_join(death_age) %>% left_join(death_cause_primary), "preprocessed/death_primary_cause.Rds")
+
+
+death_cause_secondary <- get_field(40002) %>% select(individual_id, instance_id, icd10 = value)
+death_cause_secondary$icd10_short <- strtrim(death_cause_secondary$icd10, 3)
+
+saveRDS(death_date %>% left_join(death_age) %>% left_join(death_cause_secondary), "preprocessed/death_secondary_cause.Rds")
+```
+
+
+```{r meds}
+# Extract medication data
+# Retrieves medication codes and cleans medication names by removing suffixes
+meds <- get_field(fld_id = 20003)
+meds$medication <- gsub("_\\d+$", "", meds$value)
+# meds %>% group_by(medication) %>% summarise(n=n(), N=n_distinct(individual_id)) %>% arrange(desc(N))
+saveRDS(meds, "preprocessed/UKBB_Medications.Rds")
+```
+
+## Update Death from death registry
+```{r}
+# Update death records with external death registry data
+# Merges UK Biobank death data with HESIN death registry for completeness
+## death events
+DEATH <- readRDS("preprocessed/UKBB_Death.Rds")
+death <- read.csv("~/Projects/UKBB/HESIN/death.txt", sep = "\t")
+death$date <- as.Date(death$date_of_death, format = "%d/%m/%Y") 
+death$icd10 <- "Death"
+
+# Update death record
+DEATH <- union(DEATH, death %>% select(individual_id = eid, date, icd10))
+saveRDS(DEATH, "preprocessed/UKBB_Death.Rds")
+```
+
+
+# get first instance of diseases
+```{r}
+# Extract first occurrence dates for diseases
+# Iterates through disease date fields (categories 2401-2417) and retrieves
+# the earliest occurrence date for each disease per individual
+# Uses error handling to continue processing if individual fields fail to download
+# Filter for disease date fields
+first_disease_instance <- ukbb_env$field_df %>% 
+  filter(category_id >= 2401 & category_id <= 2417) %>% 
+  filter(grepl("^Date", field_name))
+
+first_disease_instance$icd10 <- gsub("Date (\\S+)(.*)", "\\1", first_disease_instance$field_name, perl = TRUE)
+
+# Wrapper if download fails
+try_get_field <- function(fid) { 
+  tryCatch(
+    expr = { out <- get_field(fld_id = fid); return(out); }, 
+    error = function(e){ return(data.frame()); }
+  )
+}
+  
+EVENTS <- data.frame()
+for(i in 1:nrow(first_disease_instance)) {
+  print(i)
+  fid <- first_disease_instance$field_id[i]
+  icd10 <- first_disease_instance$icd10[i]
+  nevents <- sum(EVENTS$icd10 == icd10)
+  if(nevents > 0) next
+  
+  tmp <- try_get_field(fid)
+  if(nrow(tmp) > 0) { 
+    tmp <- tmp %>% group_by(individual_id) %>% summarise(date = min(value))
+    tmp$icd10 <- icd10
+    EVENTS <- rbind(EVENTS, tmp)
+    # Note: Rbind in a loop is slow for many iterations, consider accumulating in a list
+  }
+}
+saveRDS(EVENTS, "preprocessed/UKBB_Events.Rds")
+```
+
+
+
+#Pre-existing conditions
+```{r} 
+# Extract pre-existing medical conditions at baseline (instance 0)
+# Retrieves self-reported conditions including hypertension, angina, asthma,
+# heart attack, stroke, diabetes, and cancer history
+# Converts values to binary indicators (TRUE/FALSE)
+self_reported <- ukbb_env$field_df %>% filter(category_id == 100044)
+first_disease_instance$icd10 <- gsub("Date (\\S+)(.*)", "\\1", first_disease_instance$field_name, perl = TRUE)
+
+# Construct table of pre-existing conditions
+PREV_CONDITIONS <- get_field(fld_id = 2966) %>% filter(instance_id == 0) %>% select(individual_id, prev_hypert = value) %>% mutate(prev_hypert = prev_hypert > 0) %>% 
+  full_join(get_field(fld_id = 3627) %>% filter(instance_id == 0) %>% select(individual_id, prev_angina = value) %>% mutate(prev_angina = prev_angina > 0)) %>% 
+  full_join(get_field(fld_id = 3761) %>% filter(instance_id == 0) %>% select(individual_id, prev_heyfev = value) %>% mutate(prev_heyfev = prev_heyfev > 0)) %>% 
+  full_join(get_field(fld_id = 3786) %>% filter(instance_id == 0) %>% select(individual_id, prev_asthma = value) %>% mutate(prev_asthma = prev_asthma > 0)) %>% 
+  full_join(get_field(fld_id = 3894) %>% filter(instance_id == 0) %>% select(individual_id, prev_heartattack = value) %>% mutate(prev_heartattack = prev_heartattack > 0)) %>% 
+  full_join(get_field(fld_id = 4012) %>% filter(instance_id == 0) %>% select(individual_id, prev_vein_throm = value) %>% mutate(prev_vein_throm = prev_vein_throm > 0)) %>% 
+  full_join(get_field(fld_id = 4022) %>% filter(instance_id == 0) %>% select(individual_id, prev_pulmon = value) %>% mutate(prev_pulmon = prev_pulmon > 0)) %>% 
+  full_join(get_field(fld_id = 4056) %>% filter(instance_id == 0) %>% select(individual_id, prev_stroke = value) %>% mutate(prev_stroke = prev_stroke > 0)) %>% 
+  full_join(get_field(fld_id = 2453) %>% filter(instance_id == 0) %>% select(individual_id, prev_cancer = value) %>% mutate(prev_cancer = prev_cancer != "No")) %>% 
+  full_join(get_field(fld_id = 2443) %>% filter(instance_id == 0) %>% select(individual_id, prev_diab = value))
+
+colSums(PREV_CONDITIONS[,-1], na.rm = TRUE)
+self_reported <- ukbb_env$field_df %>% filter(category_id == 100044) %>% filter(grepl("^Age", field_name))
+PREV_CONDITIONS[is.na(PREV_CONDITIONS)] <- FALSE
+saveRDS(PREV_CONDITIONS, "preprocessed/UKBB_PrevCond.Rds")
+```
+
+# Spirometry 
+```{r}
+# Extract spirometry measurements
+# Retrieves lung function tests including FVC, FEV1, and PEF
+# Takes maximum values per individual and binarizes categorical variables
+### Get spirometry fields
+FVC <- get_field(fld_id = 3062) %>% select(individual_id, instance_id, FVC = value) %>%
+   group_by(individual_id) %>%  summarise(FVC = max(FVC))
+FEV1 <- get_field(fld_id = 3063) %>% select(individual_id, instance_id, FEV1 = value) %>% 
+  group_by(individual_id) %>%  summarise(FEV1 = max(FEV1))
+
+HEIGHT <- get_field(fld_id = 50) %>% select(individual_id, instance_id, HEIGHT = value)
+PEF <- get_field(fld_id = 3064) %>%  select(individual_id, instance_id,  PEF = value) %>% 
+  group_by(individual_id) %>%  summarise(PEF = max(PEF))
+
+USE_INHALER <- get_field(fld_id = 3090) %>% select(individual_id, instance_id, USE_INHALER = value)
+SMOKED_1HR_AGO <- get_field(fld_id = 3159) %>% select(individual_id, instance_id, SMOKED_1HR_AGO = value)
+CONTRA_INDICATION_SPIROM <- get_field(fld_id = 3088) %>% select(individual_id, instance_id, CONTRA_INDICATION_SPIROM = value)
+
+SPIROMETRY <- USE_INHALER %>% 
+  left_join(FVC) %>% 
+  left_join(FEV1) %>% 
+  left_join(PEF) %>% 
+  left_join(SMOKED_1HR_AGO) %>% 
+  left_join(CONTRA_INDICATION_SPIROM) %>% 
+  left_join(HEIGHT)
+
+# Binarize categorical variables
+SPIROMETRY$USE_INHALER <- ifelse(SPIROMETRY$USE_INHALER == 0, 0, 1)
+SPIROMETRY$SMOKED_1HR_AGO <- ifelse(SPIROMETRY$SMOKED_1HR_AGO == "No", 0, 1)
+SPIROMETRY$CONTRA_INDICATION_SPIROM <- ifelse(SPIROMETRY$CONTRA_INDICATION_SPIROM == 0, 0, 1)
+
+saveRDS(SPIROMETRY, "preprocessed/UKBB_Spirometry.Rds")
+```
+
+# BIOMARKERS 
+```{r}
+# Extract biomarker measurements from blood samples
+# Retrieves all fields in biomarker category (17518) and complete blood count (100081)
+# Creates wide-format data frames with one row per individual/instance
+fields <- ukbb_env$field_df %>% filter(category_id == 17518) %>% select(field_id, clean_name)
+BIOMARKERS <- data.frame()
+
+for(i in 1:nrow(fields)) {
+  tmp <- get_field(fld_id = fields$field_id[i]) %>% select(individual_id, instance_id, value)
+  colnames(tmp)[3] <- fields$clean_name[i]
+  
+  if(nrow(BIOMARKERS) == 0 ) { 
+    BIOMARKERS <- tmp
+    next
+  } else { 
+    BIOMARKERS <- BIOMARKERS %>% full_join(tmp, by = c("individual_id", "instance_id")) 
+  }
+}
+saveRDS(BIOMARKERS, "preprocessed/UKBB_Biomarkers.Rds")
+
+fields <- ukbb_env$field_df %>% filter(category_id == 100081) %>% select(field_id, clean_name)
+CBC <- data.frame()
+
+for(i in 1:nrow(fields)) {
+  tmp <- get_field(fld_id = fields$field_id[i]) %>% select(individual_id, instance_id, value)
+  colnames(tmp)[3] <- fields$clean_name[i]
+  
+  if(nrow(CBC) == 0 ) { 
+    CBC <- tmp
+    next
+  } else { 
+    CBC <- CBC %>% full_join(tmp, by = c("individual_id", "instance_id")) 
+  }
+}
+saveRDS(CBC, "preprocessed/UKBB_CBC.Rds")
+```
+
+```{r}
+# Extract lipid panel measurements
+# Retrieves cholesterol and lipid measurements (category 220)
+fields <- ukbb_env$field_df %>% filter(category_id == 220) %>% select(field_id, clean_name)
+LIPIDS <- data.frame()
+
+for(i in 1:nrow(fields)) {
+  tmp <- get_field(fld_id = fields$field_id[i]) %>% select(individual_id, instance_id, value)
+  colnames(tmp)[3] <- fields$clean_name[i]
+  
+  if(nrow(LIPIDS) == 0 ) { 
+    LIPIDS <- tmp
+    next
+  } else { 
+    LIPIDS <- LIPIDS %>% full_join(tmp, by = c("individual_id", "instance_id")) 
+  }
+}
+saveRDS(LIPIDS, "preprocessed/UKBB_Lipids.Rds")
+```
+
+```{r}
+# Extract grip strength measurements (frailty indicator)
+# Retrieves left and right hand grip strength values
+left <- get_field(fld_id = 46)  %>% select(individual_id, instance_id, grip_left = value)
+right <- get_field(fld_id = 47) %>% select(individual_id, instance_id, grip_right = value)
+FRAILTY <- left %>% left_join(right)
+
+saveRDS(FRAILTY, "preprocessed/UKBB_FRAILTY.Rds")
+```
+
+
+```{r} 
+# Extract imaging availability indicators
+# Records which participants have DXA scans and abdominal MRI data
+age_visited <- get_field(fld_id = 21003) %>% select(individual_id, instance_id, age_visit = value)
+dxa_images <- get_field(fld_id = 20158) %>% select(individual_id, instance_id, dxa_images = value)
+abdominal_mri <- get_field(fld_id = 12224) %>% select(individual_id, instance_id, abdominal_mri = value)
+visit_date <- get_field(fld_id = 53) %>% select(individual_id, instance_id, visit_date = value)
+
+IMAGING <- abdominal_mri %>% 
+  full_join(dxa_images) %>% 
+  left_join(age_visited) %>% 
+  left_join(visit_date)
+saveRDS(IMAGING, "preprocessed/UKBB_HAS_IMAGING.Rds")
+```
+
+##Biological Sampling
+```{r}
+# Extract blood sample collection metadata
+# Retrieves number of samples, fasting time, and time of blood draw
+# Converts collection time to hour/minute format for chronobiology analysis
+numsamples <- get_field(fld_id = 68) %>%
+  select(individual_id, instance_id, numsamples = value)
+
+fasting <- get_field(fld_id = 74) %>%
+  select(individual_id, instance_id, fastingtime = value)
+
+timecollected <- read.csv("preprocessed/aging_18448_phenotypes_processed_v9_fields_field_3166.csv") 
+timecollected$timestamp <- as.POSIXct(timecollected$value, tz = "GMT")
+timecollected$hourminute <- as.double(format(as.POSIXct(timecollected$value), format = "%H%M"))
+
+timecollected <- timecollected %>% 
+  filter(array_id == 0) %>% 
+  select(individual_id, instance_id, timestamp, hourminute)
+bloodsamples <- numsamples %>% left_join(fasting) %>% left_join(timecollected)
+saveRDS(bloodsamples, "preprocessed/UKBB_BLOODSAMPLES.Rds")
+```
+
+##Heel BMD
+```{r}
+# Extract heel bone mineral density measurements
+# Retrieves all fields in heel BMD category (100018) including ultrasound measures
+fields <- ukbb_env$field_df %>% filter(category_id == 100018) %>% select(field_id, clean_name)
+
+HEEL <- data.frame()
+for(i in 1:nrow(fields)) {
+   tmp <- get_field(fld_id = fields$field_id[i]) %>% select(individual_id, instance_id, value)
+   colnames(tmp)[3] <- fields$clean_name[i]
+   
+   if(nrow(HEEL) == 0 ) { 
+     HEEL <- tmp
+     next
+   } else { 
+     HEEL <- HEEL %>% full_join(tmp, by = c("individual_id", "instance_id")) 
+   }
+}
+
+saveRDS(HEEL, "preprocessed/HEEL_BMD.Rds")
+```
+
+### Physiology / Enviroment
+```{r}
+# Extract physiology and environmental measurements at baseline
+# Retrieves fields specified in UKBB_Field_Selection.tsv file
+# Averages array measurements and creates wide-format data
+fields <- read.csv("data/UKBB_Field_Selection.tsv", sep = "\t") %>% 
+  filter(INCLUDE == TRUE) %>% 
+  select(field_id, clean_name)
+
+ENVPHYSOLOGY <- data.frame()
+for(i in 1:nrow(fields)) {
+  print(fields$clean_name[i])
+  tmp <- get_field(fld_id = fields$field_id[i]) %>% filter(instance_id == 0)
+  
+  if ("array_id" %in% colnames(tmp)) { 
+    tmp <- tmp %>% 
+      group_by(individual_id, instance_id) %>% 
+      summarise(mean_value = mean(value, na.rm = TRUE)) %>% 
+      select(individual_id, mean_value)
+  } else { 
+    tmp <- tmp %>% select(individual_id, instance_id, value)
+  }
+  
+  colnames(tmp)[2] <- fields$clean_name[i]
+  
+  if(nrow(ENVPHYSOLOGY) == 0 ) { 
+    ENVPHYSOLOGY <- tmp
+  } else { 
+    ENVPHYSOLOGY <- ENVPHYSOLOGY %>% full_join(tmp, by = "individual_id")
+  }
+}
+saveRDS(ENVPHYSOLOGY, "preprocessed/UKBB_EnvPhysiology.Rds")
+```
+
+#hospitalization records
+```{r}
+# Extract hospital episode statistics (HES) inpatient data
+# Retrieves ICD-10 diagnosis codes and episode start dates from HESIN records
+# Links diagnosis data with episode information
+HESEIN <- read.csv("~/Projects/UKBB/HESIN/hesin_diag.txt", sep = "\t")
+HESEIN <- HESEIN %>% select(eid, ins_index, arr_index, diag_icd10)
+
+HESEINI <- read.csv("~/Projects/UKBB/HESIN/hesin.txt", sep = "\t") %>% 
+  select(eid, ins_index, epistart)
+
+HESEIN <- HESEIN %>% 
+  left_join(HESEINI) %>% 
+  select(individual_id = eid, date = epistart, icd10 = diag_icd10)
+HESEIN$date <- as.Date(HESEIN$date, format = "%d/%m/%Y")
+
+saveRDS(HESEIN, file = "preprocessed/UKBB_EHR.Rds")
+```
+
+#Merge all event data from EHR, Cancer, and Death records
+```{r}
+# Merge all disease and death event data from multiple sources
+# Combines self-reported diagnoses, cancer registry, death records, and HES data
+# Truncates ICD-10 codes to 3 characters for consistency
+# Keeps only the earliest event date per individual per disease
+# Event data
+EVENTS <- readRDS("preprocessed/UKBB_Events.Rds")
+EVENTS$date <- as.Date(EVENTS$date)
+
+CANCER <- readRDS("preprocessed/UKBB_Cancer.Rds")
+CANCER$date <- as.Date(CANCER$date)
+CANCER$icd10 <- strtrim(CANCER$icd10, 3)
+
+DEATH <- readRDS("preprocessed/UKBB_Death.Rds")
+
+HESEIN <- readRDS("preprocessed/UKBB_EHR.Rds")
+HESEIN$icd10 <- strtrim(HESEIN$icd10, 3)
+HESEIN <- HESEIN %>% select(individual_id, date, icd10)
+
+# Merge all sources
+EVENTS <- union(EVENTS, CANCER)
+EVENTS <- union(EVENTS, DEATH)
+EVENTS <- union(EVENTS, HESEIN)
+
+EVENTS <- EVENTS %>% 
+  filter(EVENTS$date < Sys.Date()) %>% 
+  filter(!is.na(date)) %>% 
+  filter(!is.na(icd10))
+
+# Keep earliest event per individual per icd10
+EVENTS <- EVENTS %>% 
+  group_by(individual_id, icd10) %>% 
+  summarise(date = min(date))
+
+saveRDS(EVENTS, "preprocessed/ALLEVENTS.Rds")
+```
+
+## Constall ALL EVENTS Time     Matrix
+```{r} 
+# Create time-to-event matrix for survival analysis
+# Filters for diseases with at least 200 occurrences
+# Calculates time from baseline visit to event in days
+# Creates wide matrix with one column per disease ICD-10 code
+ALLEVENTS <- readRDS("preprocessed/ALLEVENTS.Rds")
+UKBB <- readRDS("preprocessed/UKBB_BaselineCovariates.Rds")
+
+# Select top frequent diseases
+TOPDISEASE <- ALLEVENTS %>% 
+  group_by(icd10) %>%  
+  summarise(nevents = n()) %>% 
+  arrange(desc(nevents)) %>% 
+  filter(nevents >= 200)
+
+# Create matrix of time-to-event
+EVENTS_MATRIX <- ALLEVENTS %>% 
+  filter(!is.na(icd10)) %>%
+  filter(icd10 %in% TOPDISEASE$icd10) %>% 
+  left_join(UKBB %>% select(individual_id, first_visit_date)) %>% 
+  mutate(timetoevent = as.double(date - as.Date(first_visit_date))) %>% 
+  reshape2::dcast(individual_id ~ icd10, value.var = "timetoevent", 
+                  fun.aggregate = min, fill = 0)
+
+saveRDS(EVENTS_MATRIX, "preprocessed/UKBB_EVENT_MATRIX.Rds")
+```
+
+
+# Cognition
+```{r}
+# Extract cognitive function test results
+# Includes reaction time, pattern matching, fluid intelligence, numeric memory,
+# and prospective memory assessments
+# Computes correlation matrix across cognitive measures
+time_correct_matches <- get_field(fld_id = 20023) %>% select(individual_id, instance_id, time_correct_matches = value)
+
+duration_first_snap <- get_field(fld_id = 404) %>% select(individual_id, instance_id, time = value)
+duration_first_snap <- duration_first_snap %>% group_by(individual_id, instance_id) %>% summarise(duration_first_snap = mean(time))
+
+num_incorrect_matches <- get_field(fld_id = 399) %>% select(individual_id, instance_id, count = value)
+num_incorrect_matches <- num_incorrect_matches %>% group_by(individual_id, instance_id) %>% summarise(num_incorrect_matches = mean(count))
+
+
+fluid_inteligence <- get_field(fld_id = 20016) %>% select(individual_id, instance_id, count = value)
+fluid_inteligence <- fluid_inteligence %>% group_by(individual_id, instance_id) %>% summarise(fluid_inteligence = mean(count))
+
+numeric_memory <- get_field(fld_id = 4282) %>% select(individual_id, instance_id, count = value)
+numeric_memory <- numeric_memory %>% group_by(individual_id, instance_id) %>% summarise(numeric_memory = mean(count))
+
+prospective_memory <- get_field(fld_id = 20018) %>% select(individual_id, instance_id, prospective_memory_correct = value)
+prospective_memory$prospective_memory_correct <- ifelse(prospective_memory$prospective_memory_correct == "Correct recall on first attempt", 1, 0)
+
+COGNITION <- time_correct_matches %>% 
+            left_join(duration_first_snap) %>% 
+            left_join(num_incorrect_matches) %>% 
+            left_join(fluid_inteligence) %>% 
+            left_join(numeric_memory) %>% 
+            left_join(prospective_memory)
+        
+
+saveRDS(COGNITION, "preprocessed/UKBB_COGNITION.Rds")
+cor(COGNITION[, -c(1, 2)], use = "pairwise.complete.obs")
+```
+
+
+```{r cardiac}
+# Extract cardiac imaging and ECG measurements
+# Retrieves fields from cardiac categories (128, 133, 157) excluding text fields
+# Averages multiple measurements per individual/instance
+fields <- ukbb_env$field_df %>% 
+  filter(category_id == 128 | category_id == 133 | category_id == 157) %>% 
+  filter(value_type != "text") 
+
+CARDIO <- data.frame()
+for(i in 1:nrow(fields)) {
+   tmp <- get_field(fld_id = fields$field_id[i]) %>%  
+     group_by(individual_id, instance_id) %>% 
+     summarise(mean_value = mean(value, na.rm = TRUE))
+   
+   colnames(tmp)[3] <- fields$clean_name[i]
+   print(fields$clean_name[i])
+   
+   if(nrow(CARDIO) == 0) {  
+     CARDIO <- tmp
+     next
+   } 
+   CARDIO <- CARDIO %>% full_join(tmp, by = c("individual_id", "instance_id"))
+   print(dim(CARDIO))
+}
+saveRDS(CARDIO, "preprocessed/CARDIO_BMD.Rds")
+```
+
+
+```{r fat}
+# Extract body composition measurements from MRI
+# Retrieves fat distribution measurements (category 149)
+# Averages multiple measurements per individual/instance
+fields <- ukbb_env$field_df %>% 
+  filter(category_id == 149) %>% 
+  filter(value_type != "text") 
+
+FAT <- data.frame()
+for(i in 1:nrow(fields)) {
+   tmp <- get_field(fld_id = fields$field_id[i]) %>%  
+     group_by(individual_id, instance_id) %>% 
+     summarise(mean_value = mean(value, na.rm = TRUE))
+   
+   colnames(tmp)[3] <- fields$clean_name[i]
+   print(fields$clean_name[i])
+   
+   if(nrow(FAT) == 0) {  
+     FAT <- tmp
+     next
+   } 
+   FAT <- FAT %>% full_join(tmp, by = c("individual_id", "instance_id"))
+   print(dim(FAT))
+}
+saveRDS(FAT, "preprocessed/FAT_MRI.Rds")
+```
+
+```{r principal_components}
+# Extract genetic principal components for population structure adjustment
+# Retrieves first 40 genetic PCs (field 22009) and reshapes to wide format
+GeneticPCAs <- get_field(22009)
+library(reshape2)
+GeneticPCAs_WIDE <- reshape2::dcast(GeneticPCAs, individual_id ~ array_id, value.var = 'value')
+saveRDS(GeneticPCAs_WIDE, "preprocessed/GENETICS_PCAs.Rds")
+```
+
+```{r family_history}
+# Extract family history of diseases
+# Retrieves all fields in family history category (133)
+fields <- ukbb_env$field_df %>% filter(category_id == 133) %>% select(field_id, clean_name)
+
+HISTORY <- data.frame()
+for(i in 1:nrow(fields)) {
+   tmp <- get_field(fld_id = fields$field_id[i]) %>% select(individual_id, instance_id, value)
+   colnames(tmp)[3] <- fields$clean_name[i]
+   
+   if(nrow(HISTORY) == 0 ) { 
+     HISTORY <- tmp
+     next
+   } else { 
+     HISTORY <- HISTORY %>% full_join(tmp, by = c("individual_id", "instance_id")) 
+   }
+}
+saveRDS(HISTORY, "preprocessed/Family_History.Rds")
+```
+
+```{r blood_preasure}
+# Extract blood pressure and pulse measurements
+# Retrieves systolic BP, diastolic BP, and pulse rate
+# Averages multiple readings per individual/instance
+SBP <- get_field(fld_id = 4080) %>% select(individual_id, instance_id, value) %>% group_by(individual_id, instance_id) %>% summarise(SBP = mean(value, na.rm = TRUE))
+DBP <- get_field(fld_id = 4079) %>% select(individual_id, instance_id, value)  %>% group_by(individual_id, instance_id) %>% summarise(DBP = mean(value, na.rm = TRUE))
+PULSE <- get_field(fld_id = 102) %>% select(individual_id, instance_id, value)  %>% group_by(individual_id, instance_id) %>% summarise(PULSE = mean(value, na.rm = TRUE))
+
+BloodPreasure <- SBP %>% left_join(DBP) %>% left_join(PULSE)
+saveRDS(BloodPreasure, "preprocessed/UKBB_BloodPressure.Rds")
+```
